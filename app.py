@@ -192,6 +192,9 @@ load_dotenv()
 # ----------------------------- Config ---------------------------------
 PORT = int(os.getenv('PORT', '10000'))
 BINANCE_BASE = os.getenv('BINANCE_BASE', 'https://fapi.binance.com')
+BYBIT_BASE = os.getenv('BYBIT_BASE', 'https://api.bybit.com')
+MEXC_BASE = os.getenv('MEXC_BASE', 'https://api.mexc.com')
+EXCHANGE_ORDER = [x.strip().lower() for x in os.getenv('EXCHANGE_ORDER', 'binance,bybit,mexc').split(',') if x.strip()]
 WATCHLIST = [x.strip().upper() for x in os.getenv('WATCHLIST', 'BTCUSDT,ETHUSDT,SOLUSDT').split(',') if x.strip()]
 FRAMEWORK = os.getenv('FRAMEWORK', '4h_1h_15m')
 SCAN_INTERVAL = max(5, int(os.getenv('SCAN_INTERVAL_MINUTES', '15')))
@@ -205,6 +208,8 @@ GEMINI_TIMEOUT = int(os.getenv('GEMINI_TIMEOUT_SECONDS', '60'))
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DATA_DIR = os.getenv('DATA_DIR', './data')
+RESET_ON_START = os.getenv('RESET_ON_START', '1').strip().lower() in ('1','true','yes','on')
+TELEGRAM_AUTO_BIND = os.getenv('TELEGRAM_AUTO_BIND', '1').strip().lower() in ('1','true','yes','on')
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, 'smc_pro.db')
 
@@ -225,6 +230,7 @@ scheduler = BackgroundScheduler(daemon=True)
 DB_LOCK = threading.Lock()
 GEMINI_LOCK = threading.Lock()
 GEMINI_LAST_CALL = 0.0
+SCAN_LOCK = threading.Lock()
 TELEGRAM_OFFSET = 0
 BOT_ACTIVE = False
 STATE_LOCK = threading.Lock()
@@ -278,12 +284,19 @@ def state_set(key, value):
     with DB_LOCK:
         con = db(); con.execute('INSERT INTO bot_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value))); con.commit(); con.close()
 
+def current_chat_id():
+    return state_get('telegram_chat_id', TELEGRAM_CHAT_ID) or TELEGRAM_CHAT_ID
+
+def scanner_is_active():
+    return state_get('active', '0') == '1'
+
 def telegram_send(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    chat_id = current_chat_id()
+    if not TELEGRAM_TOKEN or not chat_id:
         return False
     try:
         r = requests.post(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage', json={
-            'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'Markdown', 'disable_web_page_preview': True
+            'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown', 'disable_web_page_preview': True
         }, timeout=10)
         if not r.ok:
             log.warning('Telegram error %s: %s', r.status_code, r.text[:300])
@@ -295,14 +308,63 @@ def telegram_send(text):
 def tf_label(tf):
     return tf.upper().replace('H','H').replace('M','M')
 
-# ----------------------------- Binance --------------------------------
-def fetch_klines(symbol, interval, limit=150):
+# ----------------------------- Market Data / Exchange Fallbacks --------
+_INTERVAL_SECONDS = {
+    '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+    '1h': 3600, '2h': 7200, '4h': 14400, '6h': 21600, '8h': 28800,
+    '12h': 43200, '1d': 86400,
+}
+_BYBIT_INTERVAL = {'1m':'1','3m':'3','5m':'5','15m':'15','30m':'30','1h':'60','2h':'120','4h':'240','6h':'360','8h':'480','12h':'720','1d':'D'}
+_MEXC_INTERVAL = {'1m':'Min1','5m':'Min5','15m':'Min15','30m':'Min30','1h':'Min60','4h':'Hour4','8h':'Hour8','1d':'Day1'}
+
+def _fetch_binance(symbol, interval, limit):
     r = requests.get(f'{BINANCE_BASE}/fapi/v1/klines', params={'symbol':symbol,'interval':interval,'limit':limit}, timeout=20)
     r.raise_for_status()
     out=[]
     for x in r.json():
         out.append({'open_time':x[0], 'open':float(x[1]), 'high':float(x[2]), 'low':float(x[3]), 'close':float(x[4]), 'volume':float(x[5])})
     return out
+
+def _fetch_bybit(symbol, interval, limit):
+    bi = _BYBIT_INTERVAL.get(interval)
+    if not bi: raise ValueError(f'Bybit does not support interval {interval}')
+    r = requests.get(f'{BYBIT_BASE}/v5/market/kline', params={'category':'linear','symbol':symbol,'interval':bi,'limit':min(limit,1000)}, timeout=20)
+    r.raise_for_status(); payload=r.json()
+    if payload.get('retCode') != 0: raise RuntimeError(payload.get('retMsg','Bybit error'))
+    rows=(payload.get('result') or {}).get('list') or []
+    # Bybit returns newest first: normalize to oldest -> newest.
+    rows=list(reversed(rows))
+    return [{'open_time':int(x[0]),'open':float(x[1]),'high':float(x[2]),'low':float(x[3]),'close':float(x[4]),'volume':float(x[5])} for x in rows]
+
+def _fetch_mexc(symbol, interval, limit):
+    mi = _MEXC_INTERVAL.get(interval)
+    if not mi: raise ValueError(f'MEXC does not support interval {interval}')
+    msymbol = symbol[:-4] + '_USDT' if symbol.endswith('USDT') else symbol.replace('/','_')
+    sec=_INTERVAL_SECONDS.get(interval,60); end=int(time.time()); start=end-(limit*sec)
+    r=requests.get(f'{MEXC_BASE}/api/v1/contract/kline/{msymbol}', params={'interval':mi,'start':start,'end':end}, timeout=20)
+    r.raise_for_status(); payload=r.json()
+    if not payload.get('success', False): raise RuntimeError(payload.get('message','MEXC error'))
+    d=payload.get('data') or {}
+    times=d.get('time') or []; opens=d.get('open') or []; closes=d.get('close') or []; highs=d.get('high') or []; lows=d.get('low') or []; vols=d.get('vol') or []
+    n=min(len(times),len(opens),len(closes),len(highs),len(lows),len(vols))
+    return [{'open_time':int(times[i])*1000,'open':float(opens[i]),'high':float(highs[i]),'low':float(lows[i]),'close':float(closes[i]),'volume':float(vols[i])} for i in range(n)][-limit:]
+
+def fetch_klines(symbol, interval, limit=150):
+    errors=[]
+    for exchange in EXCHANGE_ORDER:
+        try:
+            if exchange == 'binance': rows=_fetch_binance(symbol,interval,limit)
+            elif exchange == 'bybit': rows=_fetch_bybit(symbol,interval,limit)
+            elif exchange == 'mexc': rows=_fetch_mexc(symbol,interval,limit)
+            else: continue
+            if len(rows) >= min(limit,3):
+                if exchange != EXCHANGE_ORDER[0]: log.warning('[%s %s] market-data fallback -> %s', symbol, interval, exchange)
+                return rows
+            errors.append(f'{exchange}: insufficient candles ({len(rows)})')
+        except Exception as exc:
+            errors.append(f'{exchange}: {type(exc).__name__}: {exc}')
+            log.warning('[%s %s] %s failed: %s', symbol, interval, exchange, exc)
+    raise RuntimeError(f'All market-data sources failed for {symbol} {interval}: ' + ' | '.join(errors))
 
 # ----------------------------- Indicators -----------------------------
 def ema(vals, n):
@@ -534,7 +596,10 @@ def send_setup_status(symbol, direction, score, status, reason=""):
 
 def scan_once(force=False):
     global LAST_SCAN,LAST_ERROR
-    if not BOT_ACTIVE and not force: return {'status':'stopped'}
+    if not scanner_is_active() and not force: return {'status':'stopped'}
+    if not SCAN_LOCK.acquire(blocking=False):
+        log.info('Scan skipped: another scan is already running.')
+        return {'status':'already_running'}
     result={'time':now_utc(),'symbols':{}}
     for symbol in WATCHLIST:
         try:
@@ -569,10 +634,12 @@ def scan_once(force=False):
         except Exception as e:
             LAST_ERROR=f'{symbol}: {type(e).__name__}: {e}'; log.exception('scan %s',symbol); result['symbols'][symbol]={'error':str(e)}
         time.sleep(1)
-    LAST_SCAN=now_utc(); return result
+    LAST_SCAN=now_utc()
+    SCAN_LOCK.release()
+    return result
 
 def scheduled_scan():
-    if BOT_ACTIVE:
+    if scanner_is_active():
         log.info('Scheduled scan started'); scan_once()
 
 def scheduled_track():
@@ -580,25 +647,49 @@ def scheduled_track():
 
 # ----------------------------- Telegram commands ----------------------
 def telegram_poll():
-    global TELEGRAM_OFFSET,BOT_ACTIVE
-    if not TELEGRAM_TOKEN: return
+    global TELEGRAM_OFFSET, BOT_ACTIVE
+    if not TELEGRAM_TOKEN:
+        log.error('Telegram polling disabled: TELEGRAM_BOT_TOKEN is missing')
+        return
+    # getUpdates cannot run while a webhook is active. Remove any stale webhook on startup.
+    try:
+        wh=requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo', timeout=10).json()
+        if (wh.get('result') or {}).get('url'):
+            requests.post(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', params={'drop_pending_updates':False}, timeout=10)
+            log.info('Deleted Telegram webhook so long-polling can start.')
+    except Exception as exc:
+        log.warning('Telegram webhook check failed: %s', exc)
     while True:
         try:
-            r=requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates',params={'timeout':25,'offset':TELEGRAM_OFFSET},timeout=35)
-            if not r.ok: time.sleep(5); continue
+            r=requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates', params={'timeout':25,'offset':TELEGRAM_OFFSET,'allowed_updates':['message']}, timeout=35)
+            if r.status_code == 409:
+                log.error('Telegram 409 Conflict: another process is polling this bot token. Stop every older Render/local service using this token.')
+                time.sleep(10); continue
+            if not r.ok:
+                log.warning('Telegram getUpdates %s: %s', r.status_code, r.text[:300]); time.sleep(5); continue
             for u in r.json().get('result',[]):
                 TELEGRAM_OFFSET=u['update_id']+1
                 msg=u.get('message') or {}; chat=str(msg.get('chat',{}).get('id','')); text=(msg.get('text') or '').strip().split()[0].lower()
-                if TELEGRAM_CHAT_ID and chat!=str(TELEGRAM_CHAT_ID): continue
+                configured=str(TELEGRAM_CHAT_ID or '')
+                bound=str(state_get('telegram_chat_id', configured) or '')
+                # First /start can bind this bot to the current Telegram chat.
+                if text == '/start' and TELEGRAM_AUTO_BIND:
+                    state_set('telegram_chat_id', chat); bound=chat
+                if bound and chat != bound:
+                    continue
                 if text=='/start':
-                    BOT_ACTIVE=True; state_set('active','1'); telegram_send(f'▶️ *SMC AI PRO started*\nScanning every {SCAN_INTERVAL} min\nTracking existing trades every {TRACK_INTERVAL} min\nFramework: `{FRAMEWORK}`'); scheduled_scan()
+                    BOT_ACTIVE=True; state_set('active','1')
+                    telegram_send(f'▶️ *SMC AI PRO started*\nScanning every {SCAN_INTERVAL} min\nTracking every {TRACK_INTERVAL} min\nFramework: `{FRAMEWORK}`')
+                    threading.Thread(target=scan_once, kwargs={'force':True}, daemon=True, name='start-scan').start()
                 elif text=='/stop':
                     BOT_ACTIVE=False; state_set('active','0'); telegram_send('⏹️ *New signal scanning stopped.*\nExisting trades will CONTINUE to be tracked.')
                 elif text in ('/status','/health'):
-                    st=stats(); telegram_send(f'ℹ️ *Status*\nScanner: `{"ON" if BOT_ACTIVE else "OFF"}`\nTracker: `ON`\nFramework: `{FRAMEWORK}`\nTrades: `{st["total"]}`\nOpen: `{st["open"]}`\nWin rate: `{st["win_rate"]}%`')
+                    active=scanner_is_active(); st=stats(); telegram_send(f'ℹ️ *Status*\nScanner: `{"ON" if active else "OFF"}`\nTracker: `ON`\nFramework: `{FRAMEWORK}`\nTrades: `{st["total"]}`\nOpen: `{st["open"]}`\nWin rate: `{st["win_rate"]}%`')
                 elif text=='/run-now':
-                    if BOT_ACTIVE: telegram_send('🔎 Manual scan started.'); scan_once(force=True)
-                    else: telegram_send('⏸️ Scanner is stopped. Send /start first. Trade tracking remains active.')
+                    if scanner_is_active():
+                        telegram_send('🔎 Manual scan started.'); threading.Thread(target=scan_once, kwargs={'force':True}, daemon=True, name='manual-scan').start()
+                    else:
+                        telegram_send('⏸️ Scanner is OFF. Send /start first.')
                 elif text=='/trades':
                     send_trade_summary()
         except Exception as e:
@@ -614,13 +705,25 @@ def send_trade_summary():
     s=stats(); telegram_send(f'📊 *TRADE STATS*\nTotal: `{s["total"]}`\nOpen: `{s["open"]}`\nWins: `{s["wins"]}`\nLosses: `{s["losses"]}`\nPartial: `{s["partials"]}`\nWin rate: `{s["win_rate"]}%`')
 
 # ----------------------------- Web -----------------------------------
+
+@app.get('/telegram-status')
+def telegram_status():
+    if not TELEGRAM_TOKEN:
+        return jsonify({'configured':False,'error':'TELEGRAM_BOT_TOKEN missing'}), 503
+    try:
+        me=requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe', timeout=10).json()
+        wh=requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo', timeout=10).json()
+        return jsonify({'configured':True,'bot':me.get('result',{}),'webhook':wh.get('result',{}),'chat_id_bound':current_chat_id(),'scanner_active':scanner_is_active()})
+    except Exception as exc:
+        return jsonify({'configured':True,'error':str(exc)}), 502
+
 @app.get('/health')
 def health():
-    return jsonify({'status':'ok','scanner_active':BOT_ACTIVE,'tracker_active':True,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,'watchlist':WATCHLIST,'gemini_configured':bool(GEMINI_API_KEY),'telegram_configured':bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),'last_scan':LAST_SCAN,'last_error':LAST_ERROR})
+    return jsonify({'status':'ok','scanner_active':scanner_is_active(),'tracker_active':True,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,'watchlist':WATCHLIST,'gemini_configured':bool(GEMINI_API_KEY),'telegram_configured':bool(TELEGRAM_TOKEN),'telegram_chat_bound':bool(current_chat_id()),'exchanges':EXCHANGE_ORDER,'last_scan':LAST_SCAN,'last_error':LAST_ERROR})
 
 @app.get('/run-now')
 def run_now():
-    if not BOT_ACTIVE: return jsonify({'status':'stopped','message':'Send /start on Telegram first.'}), 409
+    if not scanner_is_active(): return jsonify({'status':'stopped','message':'Scanner is OFF. Send /start on Telegram first.','hint':'If /start is not reflected, check Telegram polling logs and TELEGRAM_BOT_TOKEN.'}), 409
     threading.Thread(target=scan_once,kwargs={'force':True},daemon=True).start(); return jsonify({'status':'scan started','time':now_utc()})
 
 @app.get('/api/trades')
@@ -650,11 +753,16 @@ def dashboard():
         con=db(); trades=[dict(x) for x in con.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 50').fetchall()]; scans=[dict(x) for x in con.execute('SELECT * FROM scans ORDER BY id DESC LIMIT 30').fetchall()]; con.close()
     rows=''.join(f'<tr><td>#{t["id"]}</td><td>{t["symbol"]}</td><td>{t["direction"]}</td><td>{t["score"]}</td><td>{t["status"]}</td><td>{t["highest_tp"] or 0}</td><td>{t["final_result"] or "—"}</td></tr>' for t in trades)
     scanrows=''.join(f'<tr><td>{x["time"]}</td><td>{x["symbol"]}</td><td>{x["score"]}</td><td>{x["decision"]}</td><td>{"YES" if x["gemini_called"] else "NO"}</td></tr>' for x in scans)
-    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>body{{font-family:Arial;background:#080b0f;color:#d7e0ea;margin:0;padding:24px}}h1{{color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:#11161d;border:1px solid #252d36;border-radius:12px;padding:16px}}.n{{font-size:25px;color:#fff;font-weight:700}}table{{width:100%;border-collapse:collapse;margin-top:12px;background:#0e1319}}th,td{{padding:9px;border-bottom:1px solid #202730;text-align:left;font-size:12px}}button{{padding:10px 14px;border:0;border-radius:8px;background:#ef4444;color:#fff;font-weight:700;cursor:pointer}}a{{color:#60a5fa}}section{{margin-top:28px}}</style></head><body><h1>⚡ SMC AI PRO</h1><p>Framework: <b>{FRAMEWORK}</b> · Timeframes: <b>{" → ".join(TIMEFRAMES)}</b> · Scanner: <b>{"ON" if BOT_ACTIVE else "OFF"}</b> · Tracker: <b>ON</b></p><div class="grid"><div class="card">Total<div class="n">{s['total']}</div></div><div class="card">Open<div class="n">{s['open']}</div></div><div class="card">Wins<div class="n">{s['wins']}</div></div><div class="card">Losses<div class="n">{s['losses']}</div></div><div class="card">Partial<div class="n">{s['partials']}</div></div><div class="card">Win rate<div class="n">{s['win_rate']}%</div></div></div><section><button onclick="resetAll()">Reset All Trade Statistics</button> <a href="/health">Health</a> <a href="/api/trades">Trades JSON</a> <a href="/run-now">Run Now</a></section><section><h2>Trade Tracking</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th><th>Result</th></tr>{rows or '<tr><td colspan="7">No tracked trades</td></tr>'}</table></section><section><h2>Scan Log</h2><table><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>Gemini</th></tr>{scanrows or '<tr><td colspan="5">No scans</td></tr>'}</table></section><script>async function resetAll(){{if(!confirm('Delete ALL trades and scan history?'))return;let r=await fetch('/api/reset',{{method:'POST'}});if(r.ok)location.reload();else alert('Reset failed');}}</script></body></html>'''
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>body{{font-family:Arial;background:#080b0f;color:#d7e0ea;margin:0;padding:24px}}h1{{color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:#11161d;border:1px solid #252d36;border-radius:12px;padding:16px}}.n{{font-size:25px;color:#fff;font-weight:700}}table{{width:100%;border-collapse:collapse;margin-top:12px;background:#0e1319}}th,td{{padding:9px;border-bottom:1px solid #202730;text-align:left;font-size:12px}}button{{padding:10px 14px;border:0;border-radius:8px;background:#ef4444;color:#fff;font-weight:700;cursor:pointer}}a{{color:#60a5fa}}section{{margin-top:28px}}</style></head><body><h1>⚡ SMC AI PRO</h1><p>Framework: <b>{FRAMEWORK}</b> · Timeframes: <b>{" → ".join(TIMEFRAMES)}</b> · Scanner: <b>{"ON" if scanner_is_active() else "OFF"}</b> · Tracker: <b>ON</b></p><div class="grid"><div class="card">Total<div class="n">{s['total']}</div></div><div class="card">Open<div class="n">{s['open']}</div></div><div class="card">Wins<div class="n">{s['wins']}</div></div><div class="card">Losses<div class="n">{s['losses']}</div></div><div class="card">Partial<div class="n">{s['partials']}</div></div><div class="card">Win rate<div class="n">{s['win_rate']}%</div></div></div><section><button onclick="resetAll()">Reset All Trade Statistics</button> <a href="/health">Health</a> <a href="/api/trades">Trades JSON</a> <a href="/run-now">Run Now</a></section><section><h2>Trade Tracking</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th><th>Result</th></tr>{rows or '<tr><td colspan="7">No tracked trades</td></tr>'}</table></section><section><h2>Scan Log</h2><table><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>Gemini</th></tr>{scanrows or '<tr><td colspan="5">No scans</td></tr>'}</table></section><script>async function resetAll(){{if(!confirm('Delete ALL trades and scan history?'))return;let r=await fetch('/api/reset',{{method:'POST'}});if(r.ok)location.reload();else alert('Reset failed');}}</script></body></html>'''
 
 # ----------------------------- Startup --------------------------------
 init_db()
-BOT_ACTIVE = state_get('active','0') == '1'
+if RESET_ON_START:
+    with DB_LOCK:
+        con=db(); con.execute('DELETE FROM trades'); con.execute('DELETE FROM scans'); con.execute('DELETE FROM bot_state'); con.execute("DELETE FROM sqlite_sequence WHERE name IN ('trades','scans')"); con.commit(); con.close()
+    log.info('RESET_ON_START=1 -> cleared trades, scan logs and bot state for a fresh session')
+BOT_ACTIVE = False
+state_set('active','0')
 scheduler.add_job(scheduled_scan,'interval',minutes=SCAN_INTERVAL,id='scanner',replace_existing=True,max_instances=1,coalesce=True)
 scheduler.add_job(scheduled_track,'interval',minutes=TRACK_INTERVAL,id='tracker',replace_existing=True,max_instances=1,coalesce=True)
 scheduler.start()
