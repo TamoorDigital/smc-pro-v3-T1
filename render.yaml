@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: smc-ai-pro
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: WATCHLIST
+        value: BTCUSDT,ETHUSDT,SOLUSDT
+      - key: FRAMEWORK
+        value: 4h_1h_15m
+      - key: SCAN_INTERVAL_MINUTES
+        value: 15
+      - key: TRACK_INTERVAL_MINUTES
+        value: 1
+      - key: MIN_SCORE
+        value: 70
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_MIN_INTERVAL_SECONDS
+        value: 13
+      - key: DATA_DIR
+        value: /var/data
+      - key: PORT
+        value: 10000
