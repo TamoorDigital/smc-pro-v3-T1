@@ -1,6 +1,6 @@
-ALL_SIGNALS_TELEGRAM = True
+ALL_SIGNALS_TELEGRAM = False
 
-# ─── Candlesticks + Trade Validation Engine ────────────────────────────────────
+# ─── Candlestick + Trade Validation Engine ────────────────────────────────────
 def _candle_body(c):
     return abs(c["close"] - c["open"])
 
@@ -445,55 +445,21 @@ def detect_zone(c, direction):
             return {'low':prev['low'], 'high':prev['high'], 'type':'bearish_ob'}
     return None
 
+def detect_crt(candles):
+    if len(candles) < 3:
+        return False, None
+    prev, cur = candles[-2], candles[-1]
+    bullish = cur["low"] < prev["low"] and cur["close"] > prev["low"] and cur["close"] > cur["open"]
+    bearish = cur["high"] > prev["high"] and cur["close"] < prev["high"] and cur["close"] < cur["open"]
+    return (True, "bullish") if bullish else ((True, "bearish") if bearish else (False, None))
 
-# ---------------- TBS + CRT confirmations ----------------
-def detect_crt(df):
-    """CRT-style range sweep/reclaim confirmation."""
-    try:
-        if df is None or len(df) < 3:
-            return False, "CRT unavailable"
-        prev, cur = df.iloc[-2], df.iloc[-1]
-        ph, pl = float(prev["high"]), float(prev["low"])
-        co, cc = float(cur["open"]), float(cur["close"])
-        ch, cl = float(cur["high"]), float(cur["low"])
-        mid = (ph + pl) / 2.0
-        if cl < pl and cc > mid and cc > co:
-            return True, "CRT bullish sweep/reclaim"
-        if ch > ph and cc < mid and cc < co:
-            return True, "CRT bearish sweep/reclaim"
-    except Exception:
-        pass
-    return False, "No CRT confirmation"
-
-def detect_tbs(df):
-    """TBS-style failed breakout/reclaim confirmation."""
-    try:
-        if df is None or len(df) < 3:
-            return False, "TBS unavailable"
-        prev, cur = df.iloc[-2], df.iloc[-1]
-        ph, pl = float(prev["high"]), float(prev["low"])
-        co, cc = float(cur["open"]), float(cur["close"])
-        ch, cl = float(cur["high"]), float(cur["low"])
-        if cl < pl and cc > pl and cc > co:
-            return True, "TBS bullish failed breakdown"
-        if ch > ph and cc < ph and cc < co:
-            return True, "TBS bearish failed breakout"
-    except Exception:
-        pass
-    return False, "No TBS confirmation"
-
-def tbs_crt_bonus(df, direction):
-    bonus, reasons = 0, []
-    for detector in (detect_crt, detect_tbs):
-        ok, reason = detector(df)
-        if ok:
-            bullish = "bullish" in reason.lower()
-            aligned = (direction == "LONG" and bullish) or (direction == "SHORT" and not bullish)
-            if aligned:
-                bonus += 5
-                reasons.append(reason)
-    return min(bonus, 10), reasons
-
+def detect_tbs(candles):
+    if len(candles) < 3:
+        return False, None
+    prev, cur = candles[-2], candles[-1]
+    bullish = cur["low"] < prev["low"] and cur["close"] > prev["low"] and cur["close"] > cur["open"]
+    bearish = cur["high"] > prev["high"] and cur["close"] < prev["high"] and cur["close"] < cur["open"]
+    return (True, "bullish") if bullish else ((True, "bearish") if bearish else (False, None))
 
 def build_analysis(symbol):
     tf1,tf2,tf3=TIMEFRAMES
@@ -527,6 +493,15 @@ def build_analysis(symbol):
     # Momentum 5
     if a3['bull_mom']: scores['LONG']+=5; reasons['LONG'].append(f'RSI {a3["rsi"]:.0f}')
     if a3['bear_mom']: scores['SHORT']+=5; reasons['SHORT'].append(f'RSI {a3["rsi"]:.0f}')
+    # CRT/TBS are additive confluence only; never hard filters.
+    crt_ok, crt_dir = detect_crt(c3)
+    tbs_ok, tbs_dir = detect_tbs(c3)
+    if crt_ok and crt_dir == ('bullish' if direction == 'LONG' else 'bearish'):
+        scores[direction] += 5
+        reasons[direction].append('CRT confirmation +5')
+    if tbs_ok and tbs_dir == ('bullish' if direction == 'LONG' else 'bearish'):
+        scores[direction] += 5
+        reasons[direction].append('TBS confirmation +5')
     # R:R is calculated after entry/SL/TP plan.
     direction=max(scores, key=scores.get); base=scores[direction]
     price=a3['price']; a=a3['atr'] or (price*0.005)
@@ -540,7 +515,7 @@ def build_analysis(symbol):
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
         'direction':direction,'score':score,'price':price,'entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':rr,
-        'reasons':reasons[direction], 'tf':{tf1:a1,tf2:a2,tf3:a3}, 'candles':{tf1:c1[-20:],tf2:c2[-20:],tf3:c3[-20:]}
+        'reasons':reasons[direction], 'candlestick_patterns':detect_candlestick_patterns(c3[-3:]), 'tf':{tf1:a1,tf2:a2,tf3:a3}, 'candles':{tf1:c1[-20:],tf2:c2[-20:],tf3:c3[-20:]}
     }
 
 # ----------------------------- Gemini ---------------------------------
@@ -567,15 +542,35 @@ def gemini_json(system_text, user_payload, max_output_tokens=300):
         return json.loads(m.group(0))
 
 def gemini_validate(analysis):
-    prompt={
-      'symbol':analysis['symbol'], 'framework':analysis['framework'], 'timeframes':analysis['timeframes'],
-      'direction_candidate':analysis['direction'], 'quant_score':analysis['score'],
-      'entry':analysis['entry'],'sl':analysis['sl'],'tp1':analysis['tp1'],'tp2':analysis['tp2'],'tp3':analysis['tp3'],'rr':analysis['rr'],
-      'reasons':analysis['reasons'],
-      'timeframe_analysis':{k:{x:v for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()}
+    """Final validator using MTF analysis plus supplied raw OHLCV candles."""
+    raw = {tf: candles[-20:] for tf, candles in analysis.get('candles', {}).items()}
+    prompt = {
+        'symbol': analysis['symbol'],
+        'framework': analysis['framework'],
+        'timeframes': analysis['timeframes'],
+        'direction_candidate': analysis['direction'],
+        'quant_score': analysis['score'],
+        'entry': analysis['entry'],
+        'sl': analysis['sl'],
+        'tp1': analysis['tp1'],
+        'tp2': analysis['tp2'],
+        'tp3': analysis['tp3'],
+        'rr': analysis['rr'],
+        'reasons': analysis['reasons'],
+        'timeframe_analysis': {
+            k: {x:v for x,v in a.items() if x not in ('high','low','range')}
+            for k,a in analysis['tf'].items()
+        },
+        'candlestick_patterns': analysis.get('candlestick_patterns', []),
+        'raw_market_candles': raw
     }
-    system='''You are the FINAL VALIDATOR for a crypto trading research bot. Do not invent market data. Review only the supplied structured analysis. Approve only when the multi-timeframe direction is coherent, the setup has a plausible liquidity/structure trigger, and the proposed risk plan is valid. You are not a guaranteed predictor. Return JSON only: {"decision":"APPROVE"|"REJECT","confidence":0-100,"reason":"short reason","risk_note":"short note"}. Reject contradictions, weak structure, or invalid risk/reward.'''
-    return gemini_json(system, prompt)
+    system = """You are the FINAL VALIDATOR for a crypto trading research bot.
+Do not invent market data. Review only the supplied analysis and raw OHLCV candles.
+Approve only when MTF direction, structure/liquidity, candlestick evidence and the
+proposed Entry/SL/TP1/TP2/TP3 are coherent. TP2 must provide at least 1:2 R:R.
+Reject contradictions or invalid levels. Return JSON only:
+{"decision":"APPROVE"|"REJECT","confidence":0-100,"reason":"short reason","risk_note":"short note"}"""
+    return gemini_json(system, prompt, max_output_tokens=700)
 
 # ----------------------------- Trades ---------------------------------
 def insert_trade(a, ai):
@@ -658,18 +653,27 @@ def scan_once(force=False):
                 reason='; '.join(a['reasons']) or 'insufficient confluence'
                 with DB_LOCK:
                     con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,'NO_TRADE',0,reason)); con.commit(); con.close()
-                telegram_send(f'⚪ *NO TRADE — {symbol}*\nScore: `{score}/100`\nRequired: `{MIN_SCORE}`\nGemini: `SKIPPED`\nReason: {reason}')
                 result['symbols'][symbol]={'score':score,'decision':'NO_TRADE','gemini':False}; continue
             if has_open_similar(symbol,a['direction']):
-                result['symbols'][symbol]={'score':score,'decision':'SKIP_OPEN_TRADE','gemini':False}; continue
+                reason='similar trade already open/waiting entry'
+                with DB_LOCK:
+                    con=db()
+                    con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
+                                (now_utc(),symbol,score,'SKIP_OPEN_TRADE',0,reason))
+                    con.commit(); con.close()
+                result['symbols'][symbol]={'score':score,'decision':'SKIP_OPEN_TRADE','gemini':False,'reason':reason}
+                continue
             gemini_called=1
             try:
                 ai=gemini_validate(a)
             except Exception as exc:
                 reason=f'Gemini error: {type(exc).__name__}: {exc}'
-                ai={'approved':False,'error':reason}
+                ai={'decision':'REJECT','confidence':0,'reason':reason}
                 with DB_LOCK:
-                    con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,'GEMINI_ERROR',1,reason)); con.commit(); con.close()
+                    con=db()
+                    con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
+                                (now_utc(),symbol,score,'GEMINI_ERROR',1,reason))
+                    con.commit(); con.close()
                 result['symbols'][symbol]={'score':score,'decision':'GEMINI_ERROR','gemini':True,'ai':ai,'reason':reason}
                 continue
             gemini_approved=str(ai.get('decision','REJECT')).upper()=='APPROVE'
@@ -687,8 +691,6 @@ def scan_once(force=False):
             if approved:
                 tid=insert_trade(a,ai)
                 telegram_send(f'🚨 *SMC AI PRO — {a["direction"]} {symbol}*\nTrade #{tid}\nQuant Score: `{score}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{a["entry"]:.6f}`\nSL: `{a["sl"]:.6f}`\nTP1: `{a["tp1"]:.6f}`\nTP2: `{a["tp2"]:.6f}`\nTP3: `{a["tp3"]:.6f}`\nR:R: `1:{a["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
-            elif ALL_SIGNALS_TELEGRAM:
-                send_setup_status(symbol, a['direction'], score, 'WAIT/WATCH', reason)
             result['symbols'][symbol]={'score':score,'decision':decision,'gemini':True,'ai':ai,'reason':reason}
         except Exception as e:
             LAST_ERROR=f'{symbol}: {type(e).__name__}: {e}'; log.exception('scan %s',symbol); result['symbols'][symbol]={'error':str(e)}
