@@ -445,22 +445,6 @@ def detect_zone(c, direction):
             return {'low':prev['low'], 'high':prev['high'], 'type':'bearish_ob'}
     return None
 
-def detect_crt(candles):
-    if len(candles) < 3:
-        return False, None
-    prev, cur = candles[-2], candles[-1]
-    bullish = cur["low"] < prev["low"] and cur["close"] > prev["low"] and cur["close"] > cur["open"]
-    bearish = cur["high"] > prev["high"] and cur["close"] < prev["high"] and cur["close"] < cur["open"]
-    return (True, "bullish") if bullish else ((True, "bearish") if bearish else (False, None))
-
-def detect_tbs(candles):
-    if len(candles) < 3:
-        return False, None
-    prev, cur = candles[-2], candles[-1]
-    bullish = cur["low"] < prev["low"] and cur["close"] > prev["low"] and cur["close"] > cur["open"]
-    bearish = cur["high"] > prev["high"] and cur["close"] < prev["high"] and cur["close"] < cur["open"]
-    return (True, "bullish") if bullish else ((True, "bearish") if bearish else (False, None))
-
 def build_analysis(symbol):
     tf1,tf2,tf3=TIMEFRAMES
     c1=fetch_klines(symbol,tf1,160); c2=fetch_klines(symbol,tf2,160); c3=fetch_klines(symbol,tf3,160)
@@ -493,15 +477,6 @@ def build_analysis(symbol):
     # Momentum 5
     if a3['bull_mom']: scores['LONG']+=5; reasons['LONG'].append(f'RSI {a3["rsi"]:.0f}')
     if a3['bear_mom']: scores['SHORT']+=5; reasons['SHORT'].append(f'RSI {a3["rsi"]:.0f}')
-    # CRT/TBS are additive confluence only; never hard filters.
-    crt_ok, crt_dir = detect_crt(c3)
-    tbs_ok, tbs_dir = detect_tbs(c3)
-    if crt_ok and crt_dir == ('bullish' if direction == 'LONG' else 'bearish'):
-        scores[direction] += 5
-        reasons[direction].append('CRT confirmation +5')
-    if tbs_ok and tbs_dir == ('bullish' if direction == 'LONG' else 'bearish'):
-        scores[direction] += 5
-        reasons[direction].append('TBS confirmation +5')
     # R:R is calculated after entry/SL/TP plan.
     direction=max(scores, key=scores.get); base=scores[direction]
     price=a3['price']; a=a3['atr'] or (price*0.005)
@@ -515,62 +490,68 @@ def build_analysis(symbol):
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
         'direction':direction,'score':score,'price':price,'entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':rr,
-        'reasons':reasons[direction], 'candlestick_patterns':detect_candlestick_patterns(c3[-3:]), 'tf':{tf1:a1,tf2:a2,tf3:a3}, 'candles':{tf1:c1[-20:],tf2:c2[-20:],tf3:c3[-20:]}
+        'reasons':reasons[direction], 'tf':{tf1:a1,tf2:a2,tf3:a3}, 'candles':{tf1:c1[-20:],tf2:c2[-20:],tf3:c3[-20:]}
     }
 
 # ----------------------------- Gemini ---------------------------------
-def gemini_json(system_text, user_payload, max_output_tokens=300):
-    """Shared low-level Gemini call: rate-limited, JSON-only. Used by every Gemini-calling function."""
+def gemini_json(system, payload, max_output_tokens=500):
     global GEMINI_LAST_CALL
-    if not GEMINI_API_KEY:
-        raise RuntimeError('GEMINI_API_KEY is missing')
-    body={'system_instruction':{'parts':[{'text':system_text}]},'contents':[{'role':'user','parts':[{'text':json.dumps(user_payload)}]}], 'generationConfig':{'temperature':0.1,'maxOutputTokens':max_output_tokens,'responseMimeType':'application/json'}}
-    with GEMINI_LOCK:
-        wait=GEMINI_MIN_INTERVAL-(time.monotonic()-GEMINI_LAST_CALL)
-        if wait>0: time.sleep(wait)
-        url=f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
-        r=requests.post(url, params={'key':GEMINI_API_KEY}, json=body, timeout=GEMINI_TIMEOUT)
-        GEMINI_LAST_CALL=time.monotonic()
-        if r.status_code==429:
-            raise RuntimeError(f'Gemini 429 RESOURCE_EXHAUSTED: {r.text[:700]}')
-        r.raise_for_status(); data=r.json()
-    txt=data['candidates'][0]['content']['parts'][0]['text'].strip()
-    try: return json.loads(txt)
-    except json.JSONDecodeError:
-        m=re.search(r'\{.*\}',txt,re.S)
-        if not m: raise RuntimeError('Gemini returned non-JSON: '+txt[:500])
-        return json.loads(m.group(0))
 
+    if not GEMINI_API_KEY:
+        log.error('[GEMINI] NOT_CALLED: GEMINI_API_KEY is missing')
+        raise RuntimeError('GEMINI_API_KEY is missing')
+
+    now=time.time()
+    wait=GEMINI_MIN_INTERVAL_SECONDS-(now-GEMINI_LAST_CALL)
+    if wait>0:
+        log.info('[GEMINI] rate-limit spacing: waiting %.2fs', wait)
+        time.sleep(wait)
+
+    GEMINI_LAST_CALL=time.time()
+    url=f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+    body={'contents':[{'role':'user','parts':[{'text':system+'\\n\\nINPUT JSON:\\n'+json.dumps(payload, separators=(',',':'))}]}],
+          'generationConfig':{'temperature':0.1,'responseMimeType':'application/json','maxOutputTokens':max_output_tokens}}
+
+    log.info('[GEMINI] CALLING model=%s symbol=%s score=%s',
+             GEMINI_MODEL, payload.get('symbol','?'), payload.get('score','?'))
+
+    try:
+        r=requests.post(url, params={'key':GEMINI_API_KEY}, json=body, timeout=GEMINI_TIMEOUT)
+        safe_preview=r.text[:500].replace('\\n',' ')
+        log.info('[GEMINI] HTTP %s symbol=%s response=%s',
+                 r.status_code, payload.get('symbol','?'), safe_preview)
+
+        if r.status_code==429:
+            raise RuntimeError(f'Gemini 429 RESOURCE_EXHAUSTED: {safe_preview}')
+        if r.status_code in (400,401,403):
+            raise RuntimeError(f'Gemini HTTP {r.status_code}: {safe_preview}')
+
+        r.raise_for_status()
+        data=r.json()
+        txt=data['candidates'][0]['content']['parts'][0]['text']
+        parsed=json.loads(txt)
+        log.info('[GEMINI] PARSED symbol=%s decision=%s confidence=%s',
+                 payload.get('symbol','?'), parsed.get('decision'), parsed.get('confidence'))
+        return parsed
+
+    except requests.RequestException as exc:
+        log.exception('[GEMINI] REQUEST_EXCEPTION symbol=%s: %s',
+                      payload.get('symbol','?'), exc)
+        raise
+    except Exception as exc:
+        log.exception('[GEMINI] RESPONSE/PARSE_EXCEPTION symbol=%s: %s',
+                      payload.get('symbol','?'), exc)
+        raise
 def gemini_validate(analysis):
-    """Final validator using MTF analysis plus supplied raw OHLCV candles."""
-    raw = {tf: candles[-20:] for tf, candles in analysis.get('candles', {}).items()}
-    prompt = {
-        'symbol': analysis['symbol'],
-        'framework': analysis['framework'],
-        'timeframes': analysis['timeframes'],
-        'direction_candidate': analysis['direction'],
-        'quant_score': analysis['score'],
-        'entry': analysis['entry'],
-        'sl': analysis['sl'],
-        'tp1': analysis['tp1'],
-        'tp2': analysis['tp2'],
-        'tp3': analysis['tp3'],
-        'rr': analysis['rr'],
-        'reasons': analysis['reasons'],
-        'timeframe_analysis': {
-            k: {x:v for x,v in a.items() if x not in ('high','low','range')}
-            for k,a in analysis['tf'].items()
-        },
-        'candlestick_patterns': analysis.get('candlestick_patterns', []),
-        'raw_market_candles': raw
+    prompt={
+      'symbol':analysis['symbol'], 'framework':analysis['framework'], 'timeframes':analysis['timeframes'],
+      'direction_candidate':analysis['direction'], 'quant_score':analysis['score'],
+      'entry':analysis['entry'],'sl':analysis['sl'],'tp1':analysis['tp1'],'tp2':analysis['tp2'],'tp3':analysis['tp3'],'rr':analysis['rr'],
+      'reasons':analysis['reasons'],
+      'timeframe_analysis':{k:{x:v for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()}
     }
-    system = """You are the FINAL VALIDATOR for a crypto trading research bot.
-Do not invent market data. Review only the supplied analysis and raw OHLCV candles.
-Approve only when MTF direction, structure/liquidity, candlestick evidence and the
-proposed Entry/SL/TP1/TP2/TP3 are coherent. TP2 must provide at least 1:2 R:R.
-Reject contradictions or invalid levels. Return JSON only:
-{"decision":"APPROVE"|"REJECT","confidence":0-100,"reason":"short reason","risk_note":"short note"}"""
-    return gemini_json(system, prompt, max_output_tokens=700)
+    system='''You are the FINAL VALIDATOR for a crypto trading research bot. Do not invent market data. Review only the supplied structured analysis. Approve only when the multi-timeframe direction is coherent, the setup has a plausible liquidity/structure trigger, and the proposed risk plan is valid. You are not a guaranteed predictor. Return JSON only: {"decision":"APPROVE"|"REJECT","confidence":0-100,"reason":"short reason","risk_note":"short note"}. Reject contradictions, weak structure, or invalid risk/reward.'''
+    return gemini_json(system, prompt)
 
 # ----------------------------- Trades ---------------------------------
 def insert_trade(a, ai):
@@ -653,30 +634,27 @@ def scan_once(force=False):
                 reason='; '.join(a['reasons']) or 'insufficient confluence'
                 with DB_LOCK:
                     con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,'NO_TRADE',0,reason)); con.commit(); con.close()
+                telegram_send(f'⚪ *NO TRADE — {symbol}*\nScore: `{score}/100`\nRequired: `{MIN_SCORE}`\nGemini: `SKIPPED`\nReason: {reason}')
                 result['symbols'][symbol]={'score':score,'decision':'NO_TRADE','gemini':False}; continue
             if has_open_similar(symbol,a['direction']):
-                reason='similar trade already open/waiting entry'
-                with DB_LOCK:
-                    con=db()
-                    con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
-                                (now_utc(),symbol,score,'SKIP_OPEN_TRADE',0,reason))
-                    con.commit(); con.close()
-                result['symbols'][symbol]={'score':score,'decision':'SKIP_OPEN_TRADE','gemini':False,'reason':reason}
-                continue
-            gemini_called=1
+                result['symbols'][symbol]={'score':score,'decision':'SKIP_OPEN_TRADE','gemini':False}; continue
+            log.info('[GEMINI] CANDIDATE symbol=%s score=%s min_score=%s -> validation starting', symbol, score, MIN_SCORE)
             try:
                 ai=gemini_validate(a)
             except Exception as exc:
                 reason=f'Gemini error: {type(exc).__name__}: {exc}'
-                ai={'decision':'REJECT','confidence':0,'reason':reason}
+                log.exception('[GEMINI] VALIDATION_FAILED symbol=%s score=%s: %s', symbol, score, exc)
                 with DB_LOCK:
                     con=db()
                     con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
                                 (now_utc(),symbol,score,'GEMINI_ERROR',1,reason))
-                    con.commit(); con.close()
-                result['symbols'][symbol]={'score':score,'decision':'GEMINI_ERROR','gemini':True,'ai':ai,'reason':reason}
+                    con.commit()
+                    con.close()
+                result['symbols'][symbol]={'score':score,'decision':'GEMINI_ERROR','gemini':True,'ai':{'decision':'REJECT','confidence':0,'reason':reason},'reason':reason}
+                time.sleep(1)
                 continue
             gemini_approved=str(ai.get('decision','REJECT')).upper()=='APPROVE'
+            log.info('[GEMINI] VALIDATION_RESULT symbol=%s decision=%s confidence=%s', symbol, ai.get('decision'), ai.get('confidence'))
             approved=False; reason=ai.get('reason','Gemini rejected')
             if gemini_approved:
                 # Hard structural check: Gemini can say APPROVE, but the levels still must be internally valid.
