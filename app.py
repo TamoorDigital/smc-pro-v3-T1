@@ -137,9 +137,9 @@ def validate_trade_with_gemini(symbol, direction, score, analysis, trade_levels,
             "reason": "short reason"
         }
     }
-    system = "You are the FINAL VALIDATOR for a crypto trading research bot. Do NOT approve merely because the score is high. Validate every level against the supplied raw candles and structure. Return JSON only, matching the requested response_format."
+    system = "You are the FINAL VALIDATOR for a crypto trading research bot. Do NOT approve merely because the score is high. Validate every level against the supplied raw candles and structure. Return JSON only, matching the requested response_format.Do not use markdown.Do not truncate output."
     try:
-        result = gemini_json(system, prompt, max_output_tokens=500)
+        result = gemini_json(system, prompt, max_output_tokens=2200)
         return result if isinstance(result, dict) else {"decision": "REJECT", "confidence": 0, "reason": "Invalid AI response"}
     except Exception as exc:
         log.warning(f"[{symbol}] Gemini validation failed: {exc}")
