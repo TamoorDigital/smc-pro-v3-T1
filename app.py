@@ -1,4 +1,4 @@
-ALL_SIGNALS_TELEGRAM = True
+ALL_SIGNALS_TELEGRAM = False  # Telegram: one scan summary or approved trade alerts only
 
 # ─── Candlestick + Trade Validation Engine ────────────────────────────────────
 def _candle_body(c):
@@ -445,6 +445,41 @@ def detect_zone(c, direction):
             return {'low':prev['low'], 'high':prev['high'], 'type':'bearish_ob'}
     return None
 
+def detect_crt(df):
+    """CRT-style range sweep/reclaim confirmation for the 5M entry context."""
+    try:
+        if df is None or len(df) < 3:
+            return False, "CRT unavailable"
+        prev, cur = df.iloc[-2], df.iloc[-1]
+        ph, pl = float(prev['high']), float(prev['low'])
+        co, cc = float(cur['open']), float(cur['close'])
+        ch, cl = float(cur['high']), float(cur['low'])
+        mid = (ph + pl) / 2.0
+        if cl < pl and cc > mid and cc > co:
+            return True, "CRT bullish sweep/reclaim"
+        if ch > ph and cc < mid and cc < co:
+            return True, "CRT bearish sweep/reclaim"
+    except Exception:
+        pass
+    return False, "No CRT confirmation"
+
+def detect_tbs(df):
+    """TBS-style failed breakout/reclaim confirmation."""
+    try:
+        if df is None or len(df) < 3:
+            return False, "TBS unavailable"
+        prev, cur = df.iloc[-2], df.iloc[-1]
+        ph, pl = float(prev['high']), float(prev['low'])
+        co, cc = float(cur['open']), float(cur['close'])
+        ch, cl = float(cur['high']), float(cur['low'])
+        if cl < pl and cc > pl and cc > co:
+            return True, "TBS bullish failed breakdown"
+        if ch > ph and cc < ph and cc < co:
+            return True, "TBS bearish failed breakout"
+    except Exception:
+        pass
+    return False, "No TBS confirmation"
+
 def build_analysis(symbol):
     tf1,tf2,tf3=TIMEFRAMES
     c1=fetch_klines(symbol,tf1,160); c2=fetch_klines(symbol,tf2,160); c3=fetch_klines(symbol,tf3,160)
@@ -486,6 +521,21 @@ def build_analysis(symbol):
         sl=price+1.2*a; risk=sl-price; tp1=price-1.5*risk; tp2=price-2.3*risk; tp3=price-3.2*risk
     rr=abs(tp3-price)/max(abs(price-sl),1e-12)
     if rr>=2: scores[direction]+=5; reasons[direction].append('R:R >= 1:2')
+    # TBS + CRT are additive confluence, not hard requirements.
+    # They are evaluated on the 5M/lowest-timeframe candle context.
+    try:
+        crt_ok, crt_reason = detect_crt(c3)
+        tbs_ok, tbs_reason = detect_tbs(c3)
+        if crt_ok and (('bullish' in crt_reason.lower() and direction == 'LONG') or
+                       ('bearish' in crt_reason.lower() and direction == 'SHORT')):
+            scores[direction] += 5
+            reasons[direction].append(crt_reason)
+        if tbs_ok and (('bullish' in tbs_reason.lower() and direction == 'LONG') or
+                       ('bearish' in tbs_reason.lower() and direction == 'SHORT')):
+            scores[direction] += 5
+            reasons[direction].append(tbs_reason)
+    except Exception:
+        pass
     score=min(100,scores[direction])
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
@@ -594,6 +644,18 @@ def send_setup_status(symbol, direction, score, status, reason=""):
     elif status == "WAIT/WATCH":
         telegram_send(f"👀 *{symbol} {direction} — WAIT / WATCH*\nScore: *{score}/100*\n" + (f"Reason: {reason}" if reason else ""))
 
+def send_scan_summary(result):
+    """Send one Telegram message per scan unless an approved trade was found."""
+    symbols = result.get('symbols', {})
+    approved = [s for s, v in symbols.items() if v.get('decision') == 'APPROVED']
+    if approved:
+        return
+    telegram_send(
+        f"⚪ *NO SIGNAL FOUND*\n"
+        f"No valid trade setup found in this scan.\n"
+        f"Scanned: `{len(symbols)}` symbols"
+    )
+
 def scan_once(force=False):
     global LAST_SCAN,LAST_ERROR
     if not scanner_is_active() and not force: return {'status':'stopped'}
@@ -608,8 +670,8 @@ def scan_once(force=False):
                 reason='; '.join(a['reasons']) or 'insufficient confluence'
                 with DB_LOCK:
                     con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,'NO_TRADE',0,reason)); con.commit(); con.close()
-                telegram_send(f'⚪ *NO TRADE — {symbol}*\nScore: `{score}/100`\nRequired: `{MIN_SCORE}`\nGemini: `SKIPPED`\nReason: {reason}')
-                result['symbols'][symbol]={'score':score,'decision':'NO_TRADE','gemini':False}; continue
+                # Keep per-symbol details in dashboard/database, not Telegram.
+                result['symbols'][symbol]={'score':score,'decision':'NO_TRADE','gemini':False,'reason':reason}; continue
             if has_open_similar(symbol,a['direction']):
                 result['symbols'][symbol]={'score':score,'decision':'SKIP_OPEN_TRADE','gemini':False}; continue
             ai=gemini_validate(a)
@@ -628,13 +690,16 @@ def scan_once(force=False):
             if approved:
                 tid=insert_trade(a,ai)
                 telegram_send(f'🚨 *SMC AI PRO — {a["direction"]} {symbol}*\nTrade #{tid}\nQuant Score: `{score}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{a["entry"]:.6f}`\nSL: `{a["sl"]:.6f}`\nTP1: `{a["tp1"]:.6f}`\nTP2: `{a["tp2"]:.6f}`\nTP3: `{a["tp3"]:.6f}`\nR:R: `1:{a["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
-            elif ALL_SIGNALS_TELEGRAM:
-                send_setup_status(symbol, a['direction'], score, 'WAIT/WATCH', reason)
+            # WAIT/WATCH is summarized once per scan; approved trades remain individual alerts.
             result['symbols'][symbol]={'score':score,'decision':decision,'gemini':True,'ai':ai,'reason':reason}
         except Exception as e:
             LAST_ERROR=f'{symbol}: {type(e).__name__}: {e}'; log.exception('scan %s',symbol); result['symbols'][symbol]={'error':str(e)}
         time.sleep(1)
     LAST_SCAN=now_utc()
+    try:
+        send_scan_summary(result)
+    except Exception:
+        log.exception('Failed to send scan summary to Telegram')
     SCAN_LOCK.release()
     return result
 
