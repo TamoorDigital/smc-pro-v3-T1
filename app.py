@@ -1,4 +1,4 @@
-ALL_SIGNALS_TELEGRAM = True
+ALL_SIGNALS_TELEGRAM = False
 
 # ─── Candlestick + Trade Validation Engine ────────────────────────────────────
 def _candle_body(c):
@@ -647,9 +647,10 @@ def gemini_validate(analysis):
       'direction_candidate':analysis['direction'], 'quant_score':analysis['score'],
       'entry':analysis['entry'],'sl':analysis['sl'],'tp1':analysis['tp1'],'tp2':analysis['tp2'],'tp3':analysis['tp3'],'rr':analysis['rr'],
       'reasons':analysis['reasons'],
-      'timeframe_analysis':{k:{x:v for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()}
+      'timeframe_analysis':{k:{x:v for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()},
+      'raw_ohlcv_candles': analysis.get('candles', {})
     }
-    system='''You are the FINAL VALIDATOR for a crypto trading research bot. Do not invent market data. Review only the supplied structured analysis. Approve only when the multi-timeframe direction is coherent, the setup has a plausible liquidity/structure trigger, and the proposed risk plan is valid. You are not a guaranteed predictor. Return JSON only: {"decision":"APPROVE"|"REJECT","confidence":0-100,"reason":"short reason","risk_note":"short note"}. Reject contradictions, weak structure, or invalid risk/reward.'''
+    system="""You are the FINAL VALIDATOR for a crypto trading research bot. Review the supplied raw OHLCV candles and structured multi-timeframe analysis. Do not invent market data. Check 1H/15M/5M structure, SMC/liquidity/BOS, CRT, TBS, candlestick evidence, direction, and the proposed Entry/SL/TP1/TP2/TP3 levels. Approve only when the setup is coherent and the risk plan is valid. Return JSON only: {\"decision\":\"APPROVE\"|\"REJECT\",\"confidence\":0-100,\"reason\":\"short reason\",\"risk_note\":\"short note\",\"entry_valid\":true|false,\"sl_valid\":true|false,\"tp1_valid\":true|false,\"tp2_valid\":true|false,\"tp3_valid\":true|false}."""
     return gemini_json(system, prompt)
 
 # ----------------------------- Trades ---------------------------------
@@ -720,57 +721,68 @@ def send_setup_status(symbol, direction, score, status, reason=""):
         telegram_send(f"👀 *{symbol} {direction} — WAIT / WATCH*\nScore: *{score}/100*\n" + (f"Reason: {reason}" if reason else ""))
 
 def scan_once(force=False):
+    """Score ALL first, rank ALL, Gemini ONLY the highest candidate, Telegram trade-only."""
     global LAST_SCAN,LAST_ERROR
     if not scanner_is_active() and not force: return {'status':'stopped'}
-    if not SCAN_LOCK.acquire(blocking=False):
-        log.info('Scan skipped: another scan is already running.')
-        return {'status':'already_running'}
-    result={'time':now_utc(),'symbols':{}}
-    for symbol in WATCHLIST:
-        try:
-            a=build_analysis(symbol); score=a['score']
-            if score<MIN_SCORE:
-                reason='; '.join(a['reasons']) or 'insufficient confluence'
-                with DB_LOCK:
-                    con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,'NO_TRADE',0,reason)); con.commit(); con.close()
-                telegram_send(f'⚪ *NO TRADE — {symbol}*\nScore: `{score}/100`\nRequired: `{MIN_SCORE}`\nGemini: `SKIPPED`\nReason: {reason}')
-                result['symbols'][symbol]={'score':score,'decision':'NO_TRADE','gemini':False}; continue
-            if has_open_similar(symbol,a['direction']):
-                result['symbols'][symbol]={'score':score,'decision':'SKIP_OPEN_TRADE','gemini':False}; continue
-            gemini_called=1
+    if not SCAN_LOCK.acquire(blocking=False): return {'status':'already_running'}
+    result={'time':now_utc(),'symbols':{},'best':None}; analyses=[]
+    try:
+        # PASS 1: every wishlist coin is scored. No Gemini and no Telegram here.
+        for symbol in WATCHLIST:
             try:
-                ai=gemini_validate(a)
-            except Exception as exc:
-                reason=f'Gemini error: {type(exc).__name__}: {exc}'
-                ai={'approved':False,'error':reason}
-                with DB_LOCK:
-                    con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,'GEMINI_ERROR',1,reason)); con.commit(); con.close()
-                result['symbols'][symbol]={'score':score,'decision':'GEMINI_ERROR','gemini':True,'ai':ai,'reason':reason}
-                continue
-            gemini_approved=str(ai.get('decision','REJECT')).upper()=='APPROVE'
-            approved=False; reason=ai.get('reason','Gemini rejected')
-            if gemini_approved:
-                # Hard structural check: Gemini can say APPROVE, but the levels still must be internally valid.
-                level_ok, level_reason = _final_level_check(a['direction'], a['entry'], a['sl'], a['tp1'], a['tp2'], a['tp3'])
-                if level_ok:
-                    approved=True; reason=ai.get('reason','Gemini approved')
-                else:
-                    reason=f'Gemini approved but failed hard level check: {level_reason}'
-            decision='APPROVED' if approved else 'REJECTED'
+                a=build_analysis(symbol); analyses.append(a)
+                result['symbols'][symbol]={'score':a['score'],'decision':'RANKED'}
+            except Exception as e:
+                LAST_ERROR=f'{symbol}: {type(e).__name__}: {e}'; log.exception('score %s',symbol)
+                result['symbols'][symbol]={'error':str(e),'decision':'SCAN_ERROR'}
+            time.sleep(1)
+        if not analyses: return result
+        analyses.sort(key=lambda x: float(x.get('score',0)), reverse=True)
+        best=analyses[0]; best_symbol=best['symbol']; best_score=float(best['score'])
+        result['best']={'symbol':best_symbol,'score':best_score}
+        log.info('[SCAN] scores=%s | BEST=%s score=%.1f', ', '.join(f"{a['symbol']}:{a['score']}" for a in analyses), best_symbol,best_score)
+        # Dashboard scan log: every candidate, but never Telegram.
+        with DB_LOCK:
+            con=db(); now=now_utc()
+            for a in analyses:
+                d='RANKED_WAIT' if a['symbol']!=best_symbol else 'BEST_PENDING'
+                con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now,a['symbol'],a['score'],d,0,'Not highest score in this scan' if d=='RANKED_WAIT' else 'Highest score; MIN_SCORE pending'))
+            con.commit(); con.close()
+        # Only highest score reaches MIN_SCORE.
+        if best_score < MIN_SCORE:
+            reason=f'Highest score {best_score:.0f} below MIN_SCORE {MIN_SCORE}; Gemini skipped'
             with DB_LOCK:
-                con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,decision,1,reason)); con.commit(); con.close()
-            if approved:
-                tid=insert_trade(a,ai)
-                telegram_send(f'🚨 *SMC AI PRO — {a["direction"]} {symbol}*\nTrade #{tid}\nQuant Score: `{score}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{a["entry"]:.6f}`\nSL: `{a["sl"]:.6f}`\nTP1: `{a["tp1"]:.6f}`\nTP2: `{a["tp2"]:.6f}`\nTP3: `{a["tp3"]:.6f}`\nR:R: `1:{a["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
-            elif ALL_SIGNALS_TELEGRAM:
-                send_setup_status(symbol, a['direction'], score, 'WAIT/WATCH', reason)
-            result['symbols'][symbol]={'score':score,'decision':decision,'gemini':True,'ai':ai,'reason':reason}
-        except Exception as e:
-            LAST_ERROR=f'{symbol}: {type(e).__name__}: {e}'; log.exception('scan %s',symbol); result['symbols'][symbol]={'error':str(e)}
-        time.sleep(1)
-    LAST_SCAN=now_utc()
-    SCAN_LOCK.release()
-    return result
+                con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,'NO_TRADE',0,reason)); con.commit(); con.close()
+            result['symbols'][best_symbol].update({'decision':'NO_TRADE','gemini':False,'reason':reason}); return result
+        if has_open_similar(best_symbol,best['direction']):
+            reason='Highest candidate already has an open/similar tracked trade; Gemini skipped'
+            with DB_LOCK:
+                con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,'SKIP_OPEN_TRADE',0,reason)); con.commit(); con.close()
+            result['symbols'][best_symbol].update({'decision':'SKIP_OPEN_TRADE','gemini':False,'reason':reason}); return result
+        # Exactly one Gemini validation chain for the winner.
+        try:
+            ai=gemini_validate(best)
+        except Exception as exc:
+            reason=f'Gemini error: {type(exc).__name__}: {exc}'
+            with DB_LOCK:
+                con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,'GEMINI_ERROR',1,reason)); con.commit(); con.close()
+            result['symbols'][best_symbol].update({'decision':'GEMINI_ERROR','gemini':True,'ai':{'error':reason},'reason':reason}); return result
+        approved=False; reason=ai.get('reason','Gemini rejected')
+        if str(ai.get('decision','REJECT')).upper()=='APPROVE':
+            ok,why=_final_level_check(best['direction'],best['entry'],best['sl'],best['tp1'],best['tp2'],best['tp3'])
+            if ok: approved=True
+            else: reason=f'Gemini approved but failed hard level check: {why}'
+        decision='APPROVED' if approved else 'REJECTED'
+        with DB_LOCK:
+            con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,decision,1,reason)); con.commit(); con.close()
+        result['symbols'][best_symbol].update({'decision':decision,'gemini':True,'ai':ai,'reason':reason})
+        # Telegram: ONLY an actually created trade. No score spam / no rejects / no waits.
+        if approved:
+            tid=insert_trade(best,ai)
+            telegram_send(f'🚨 *SMC AI PRO — {best["direction"]} {best_symbol}*\nTrade #{tid}\nQuant Score: `{best_score:.0f}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{best["entry"]:.6f}`\nSL: `{best["sl"]:.6f}`\nTP1: `{best["tp1"]:.6f}`\nTP2: `{best["tp2"]:.6f}`\nTP3: `{best["tp3"]:.6f}`\nR:R: `1:{best["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
+        return result
+    finally:
+        LAST_SCAN=now_utc(); SCAN_LOCK.release()
 
 def scheduled_scan():
     if scanner_is_active():
