@@ -445,41 +445,6 @@ def detect_zone(c, direction):
             return {'low':prev['low'], 'high':prev['high'], 'type':'bearish_ob'}
     return None
 
-def detect_crt(df):
-    """CRT-style range sweep/reclaim confirmation for the 5M entry context."""
-    try:
-        if df is None or len(df) < 3:
-            return False, "CRT unavailable"
-        prev, cur = df.iloc[-2], df.iloc[-1]
-        ph, pl = float(prev['high']), float(prev['low'])
-        co, cc = float(cur['open']), float(cur['close'])
-        ch, cl = float(cur['high']), float(cur['low'])
-        mid = (ph + pl) / 2.0
-        if cl < pl and cc > mid and cc > co:
-            return True, "CRT bullish sweep/reclaim"
-        if ch > ph and cc < mid and cc < co:
-            return True, "CRT bearish sweep/reclaim"
-    except Exception:
-        pass
-    return False, "No CRT confirmation"
-
-def detect_tbs(df):
-    """TBS-style failed breakout/reclaim confirmation."""
-    try:
-        if df is None or len(df) < 3:
-            return False, "TBS unavailable"
-        prev, cur = df.iloc[-2], df.iloc[-1]
-        ph, pl = float(prev['high']), float(prev['low'])
-        co, cc = float(cur['open']), float(cur['close'])
-        ch, cl = float(cur['high']), float(cur['low'])
-        if cl < pl and cc > pl and cc > co:
-            return True, "TBS bullish failed breakdown"
-        if ch > ph and cc < ph and cc < co:
-            return True, "TBS bearish failed breakout"
-    except Exception:
-        pass
-    return False, "No TBS confirmation"
-
 def build_analysis(symbol):
     tf1,tf2,tf3=TIMEFRAMES
     c1=fetch_klines(symbol,tf1,160); c2=fetch_klines(symbol,tf2,160); c3=fetch_klines(symbol,tf3,160)
@@ -521,21 +486,6 @@ def build_analysis(symbol):
         sl=price+1.2*a; risk=sl-price; tp1=price-1.5*risk; tp2=price-2.3*risk; tp3=price-3.2*risk
     rr=abs(tp3-price)/max(abs(price-sl),1e-12)
     if rr>=2: scores[direction]+=5; reasons[direction].append('R:R >= 1:2')
-    # TBS + CRT are additive confluence, not hard requirements.
-    # They are evaluated on the 5M/lowest-timeframe candle context.
-    try:
-        crt_ok, crt_reason = detect_crt(c3)
-        tbs_ok, tbs_reason = detect_tbs(c3)
-        if crt_ok and (('bullish' in crt_reason.lower() and direction == 'LONG') or
-                       ('bearish' in crt_reason.lower() and direction == 'SHORT')):
-            scores[direction] += 5
-            reasons[direction].append(crt_reason)
-        if tbs_ok and (('bullish' in tbs_reason.lower() and direction == 'LONG') or
-                       ('bearish' in tbs_reason.lower() and direction == 'SHORT')):
-            scores[direction] += 5
-            reasons[direction].append(tbs_reason)
-    except Exception:
-        pass
     score=min(100,scores[direction])
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
@@ -673,8 +623,20 @@ def scan_once(force=False):
                 # Keep per-symbol details in dashboard/database, not Telegram.
                 result['symbols'][symbol]={'score':score,'decision':'NO_TRADE','gemini':False,'reason':reason}; continue
             if has_open_similar(symbol,a['direction']):
-                result['symbols'][symbol]={'score':score,'decision':'SKIP_OPEN_TRADE','gemini':False}; continue
-            ai=gemini_validate(a)
+                reason='similar trade already open/waiting entry'
+                with DB_LOCK:
+                    con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,'SKIP_OPEN_TRADE',0,reason)); con.commit(); con.close()
+                result['symbols'][symbol]={'score':score,'decision':'SKIP_OPEN_TRADE','gemini':False,'reason':reason}; continue
+            gemini_called=1
+            try:
+                ai=gemini_validate(a)
+            except Exception as exc:
+                reason=f'Gemini error: {type(exc).__name__}: {exc}'
+                ai={'decision':'REJECT','reason':reason,'error':reason}
+                with DB_LOCK:
+                    con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),symbol,score,'GEMINI_ERROR',1,reason)); con.commit(); con.close()
+                result['symbols'][symbol]={'score':score,'decision':'GEMINI_ERROR','gemini':True,'ai':ai,'reason':reason}
+                continue
             gemini_approved=str(ai.get('decision','REJECT')).upper()=='APPROVE'
             approved=False; reason=ai.get('reason','Gemini rejected')
             if gemini_approved:
