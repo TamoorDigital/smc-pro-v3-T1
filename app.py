@@ -1,6 +1,6 @@
 ALL_SIGNALS_TELEGRAM = True
 
-# ─── Candlestick + Trade Validation Engine ────────────────────────────────────
+# ─── Candlesticks + Trade Validation Engine ────────────────────────────────────
 def _candle_body(c):
     return abs(c["close"] - c["open"])
 
