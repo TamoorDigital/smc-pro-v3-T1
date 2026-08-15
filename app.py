@@ -596,7 +596,7 @@ def _parse_gemini_json_text(txt):
     raise RuntimeError('Gemini returned non-JSON: '+raw[:700])
 
 
-def gemini_json(system_text, user_payload, max_output_tokens=2000):
+def gemini_json(system_text, user_payload, max_output_tokens=2500):
     """Call Gemini with 5-key fallback. Normal REJECT is a final decision.
 
     Fallback occurs ONLY for transport/API/configuration failures or incomplete
