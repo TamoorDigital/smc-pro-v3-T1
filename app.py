@@ -78,12 +78,6 @@ def detect_candlestick_patterns(candles):
     return sorted(set(out))
 
 
-def _raw_candles_for_ai(symbol, timeframe, limit=30):
-    """Uses the same Binance kline fetcher as the rest of the app (fetch_klines)."""
-    raw = fetch_klines(symbol, timeframe, limit)
-    return raw[-limit:]
-
-
 def classify_setup(score, gemini_result=None):
     """<70: no Gemini; >=70: Gemini; only APPROVE becomes a trade."""
     if float(score) < MIN_SCORE:
@@ -96,54 +90,6 @@ def classify_setup(score, gemini_result=None):
                 "reason": gemini_result.get("reason", "Gemini approved")}
     return {"status": "WAIT/WATCH", "trade": False,
             "reason": gemini_result.get("reason", "Gemini rejected")}
-
-
-def validate_trade_with_gemini(symbol, direction, score, analysis, trade_levels, raw_context):
-    """
-    Gemini is a validator, not the primary signal generator.
-    It must explicitly validate Entry/SL/TP1/TP2/TP3 against supplied raw candles.
-    """
-    prompt = {
-        "task": "Validate this proposed crypto trade. Do NOT approve merely because the score is high.",
-        "symbol": symbol,
-        "direction": direction,
-        "quant_score": score,
-        "analysis": analysis,
-        "proposed_trade": trade_levels,
-        "raw_market_candles": raw_context,
-        "required_checks": [
-            "Validate entry against current price/structure.",
-            "Validate SL against market structure, liquidity and volatility.",
-            "Validate TP1, TP2 and TP3 against raw candles, structure and nearby liquidity.",
-            "Check that the trade direction agrees with the higher timeframe bias.",
-            "Check candlestick patterns and whether they support or contradict the setup.",
-            "Check that risk/reward is realistic.",
-            "Reject if the proposed levels are structurally invalid or contradictory.",
-            "If a level is wrong, suggest corrected levels but do not approve until the corrected levels are internally valid."
-        ],
-        "response_format": {
-            "decision": "APPROVE or REJECT",
-            "confidence": "0-100",
-            "entry_valid": "true/false",
-            "sl_valid": "true/false",
-            "tp1_valid": "true/false",
-            "tp2_valid": "true/false",
-            "tp3_valid": "true/false",
-            "suggested_entry": "number or null",
-            "suggested_sl": "number or null",
-            "suggested_tp1": "number or null",
-            "suggested_tp2": "number or null",
-            "suggested_tp3": "number or null",
-            "reason": "short reason"
-        }
-    }
-    system = "You are the FINAL VALIDATOR for a crypto trading research bot. Do NOT approve merely because the score is high. Validate every level against the supplied raw candles and structure. Return JSON only, matching the requested response_format.Do not use markdown.Do not truncate output."
-    try:
-        result = gemini_json(system, prompt, max_output_tokens=2200)
-        return result if isinstance(result, dict) else {"decision": "REJECT", "confidence": 0, "reason": "Invalid AI response"}
-    except Exception as exc:
-        log.warning(f"[{symbol}] Gemini validation failed: {exc}")
-        return {"decision": "REJECT", "confidence": 0, "reason": f"Gemini validation failed: {exc}"}
 
 
 def _final_level_check(direction, entry, sl, tp1, tp2, tp3):
@@ -196,7 +142,7 @@ BYBIT_BASE = os.getenv('BYBIT_BASE', 'https://api.bybit.com')
 MEXC_BASE = os.getenv('MEXC_BASE', 'https://api.mexc.com')
 EXCHANGE_ORDER = [x.strip().lower() for x in os.getenv('EXCHANGE_ORDER', 'binance,bybit,mexc').split(',') if x.strip()]
 WATCHLIST = [x.strip().upper() for x in os.getenv('WATCHLIST', 'BTCUSDT,ETHUSDT,SOLUSDT').split(',') if x.strip()]
-FRAMEWORK = os.getenv('FRAMEWORK', '4h_1h_15m')
+FRAMEWORK = os.getenv('FRAMEWORK', '1h_15m_5m')
 SCAN_INTERVAL = max(5, int(os.getenv('SCAN_INTERVAL_MINUTES', '15')))
 TRACK_INTERVAL = max(1, int(os.getenv('TRACK_INTERVAL_MINUTES', '1')))
 TRACK_TIMEFRAME = os.getenv('TRACK_TIMEFRAME', '1m')
@@ -228,9 +174,9 @@ TF_MAP = {
     '4h_15m_5m': ['4h', '15m', '5m'],
     '1h_30m_5m': ['1h', '30m', '5m'],
 }
-TIMEFRAMES = TF_MAP.get(FRAMEWORK, FRAMEWORK.split('_') if '_' in FRAMEWORK else ['4h','1h','15m'])
+TIMEFRAMES = TF_MAP.get(FRAMEWORK, FRAMEWORK.split('_') if '_' in FRAMEWORK else ['1h','15m','5m'])
 if len(TIMEFRAMES) != 3:
-    TIMEFRAMES = ['4h','1h','15m']
+    TIMEFRAMES = ['1h','15m','5m']
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger('smc-pro')
@@ -456,12 +402,12 @@ def detect_zone(c, direction):
 
 
 # ---------------- TBS + CRT confirmations ----------------
-def detect_crt(df):
-    """CRT-style range sweep/reclaim confirmation."""
+def detect_crt(candles):
+    """CRT-style range sweep/reclaim confirmation. candles = list of OHLCV dicts (oldest->newest)."""
     try:
-        if df is None or len(df) < 3:
+        if candles is None or len(candles) < 3:
             return False, "CRT unavailable"
-        prev, cur = df.iloc[-2], df.iloc[-1]
+        prev, cur = candles[-2], candles[-1]
         ph, pl = float(prev["high"]), float(prev["low"])
         co, cc = float(cur["open"]), float(cur["close"])
         ch, cl = float(cur["high"]), float(cur["low"])
@@ -474,12 +420,12 @@ def detect_crt(df):
         pass
     return False, "No CRT confirmation"
 
-def detect_tbs(df):
-    """TBS-style failed breakout/reclaim confirmation."""
+def detect_tbs(candles):
+    """TBS-style failed breakout/reclaim confirmation. candles = list of OHLCV dicts (oldest->newest)."""
     try:
-        if df is None or len(df) < 3:
+        if candles is None or len(candles) < 3:
             return False, "TBS unavailable"
-        prev, cur = df.iloc[-2], df.iloc[-1]
+        prev, cur = candles[-2], candles[-1]
         ph, pl = float(prev["high"]), float(prev["low"])
         co, cc = float(cur["open"]), float(cur["close"])
         ch, cl = float(cur["high"]), float(cur["low"])
@@ -491,10 +437,11 @@ def detect_tbs(df):
         pass
     return False, "No TBS confirmation"
 
-def tbs_crt_bonus(df, direction):
+def tbs_crt_bonus(candles, direction):
+    """+5 each for CRT/TBS confirmation aligned with `direction`, capped at 10."""
     bonus, reasons = 0, []
     for detector in (detect_crt, detect_tbs):
-        ok, reason = detector(df)
+        ok, reason = detector(candles)
         if ok:
             bullish = "bullish" in reason.lower()
             aligned = (direction == "LONG" and bullish) or (direction == "SHORT" and not bullish)
@@ -502,6 +449,36 @@ def tbs_crt_bonus(df, direction):
                 bonus += 5
                 reasons.append(reason)
     return min(bonus, 10), reasons
+
+
+# ---------------- CHOCH + FVG detection ----------------
+def detect_choch(c, bias, window=3):
+    """Change of CHaracter: price breaks the most recent opposite-side swing point
+    against the prevailing EMA bias -- an early reversal signal (distinct from BOS,
+    which is a continuation break)."""
+    out = {'bull_choch': False, 'bear_choch': False}
+    highs, lows = swing_levels(c, window)
+    if not highs or not lows:
+        return out
+    last = c[-1]
+    last_swing_high = highs[-1][1]
+    last_swing_low = lows[-1][1]
+    out['bull_choch'] = bias == 'BEARISH' and last['close'] > last_swing_high
+    out['bear_choch'] = bias == 'BULLISH' and last['close'] < last_swing_low
+    return out
+
+def detect_fvg(c, direction, lookback=15):
+    """3-candle Fair Value Gap: an imbalance left by a displacement candle that
+    price has not yet filled."""
+    if len(c) < 3:
+        return None
+    for i in range(len(c) - 1, max(1, len(c) - lookback), -1):
+        a, disp, cur = c[i - 2], c[i - 1], c[i]
+        if direction == 'LONG' and a['high'] < cur['low']:
+            return {'low': a['high'], 'high': cur['low'], 'type': 'bullish_fvg'}
+        if direction == 'SHORT' and a['low'] > cur['high']:
+            return {'low': cur['high'], 'high': a['low'], 'type': 'bearish_fvg'}
+    return None
 
 
 def build_analysis(symbol):
@@ -529,6 +506,31 @@ def build_analysis(symbol):
         z=detect_zone(c2,d)
         if z and z['low'] <= a3['price'] <= z['high']*1.002:
             scores[d]+=10; reasons[d].append('price at order-block zone')
+    # CHOCH 10: reversal break of the last opposite-side swing point.
+    choch=detect_choch(c2, a2['bias'])
+    if choch['bull_choch']: scores['LONG']+=10; reasons['LONG'].append('bullish CHoCH')
+    if choch['bear_choch']: scores['SHORT']+=10; reasons['SHORT'].append('bearish CHoCH')
+    # FVG 5: price trading back into an unfilled fair value gap.
+    fvg_hits={}
+    for d in ('LONG','SHORT'):
+        fvg=detect_fvg(c2,d)
+        fvg_hits[d]=fvg
+        if fvg and fvg['low'] <= a3['price'] <= fvg['high']*1.002:
+            scores[d]+=5; reasons[d].append('price inside FVG')
+    # CRT + TBS confirmation (lower-timeframe sweep/reclaim), up to 10.
+    crt_tbs_hits={}
+    for d in ('LONG','SHORT'):
+        bonus,breasons=tbs_crt_bonus(c3,d)
+        crt_tbs_hits[d]={'bonus':bonus,'reasons':breasons}
+        if bonus:
+            scores[d]+=bonus; reasons[d].extend(breasons)
+    # Candle patterns (single/double/triple) on the lowest timeframe, up to 10 / -4.
+    patterns=detect_candlestick_patterns(c3)
+    for d in ('LONG','SHORT'):
+        pbonus=build_pattern_score(patterns,d)
+        if pbonus:
+            scores[d]=max(0,scores[d]+pbonus)
+            if pbonus>0: reasons[d].append(f'candle pattern(s): {", ".join(patterns)}')
     # Volume 10
     if a3['volume_ratio']>=1.2:
         d='LONG' if a3['bull_mom'] else 'SHORT' if a3['bear_mom'] else None
@@ -549,7 +551,13 @@ def build_analysis(symbol):
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
         'direction':direction,'score':score,'price':price,'entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':rr,
-        'reasons':reasons[direction], 'tf':{tf1:a1,tf2:a2,tf3:a3}, 'candles':{tf1:c1[-20:],tf2:c2[-20:],tf3:c3[-20:]}
+        'reasons':reasons[direction], 'tf':{tf1:a1,tf2:a2,tf3:a3}, 'candles':{tf1:c1[-20:],tf2:c2[-20:],tf3:c3[-20:]},
+        'structure_flags':{
+            'choch':choch,
+            'fvg':{d:(fvg_hits[d] if fvg_hits.get(d) else None) for d in ('LONG','SHORT')},
+            'crt_tbs':crt_tbs_hits,
+            'candlestick_patterns':patterns,
+        }
     }
 
 # ----------------------------- Gemini ---------------------------------
@@ -588,7 +596,7 @@ def _parse_gemini_json_text(txt):
     raise RuntimeError('Gemini returned non-JSON: '+raw[:700])
 
 
-def gemini_json(system_text, user_payload, max_output_tokens=700):
+def gemini_json(system_text, user_payload, max_output_tokens=1800):
     """Call Gemini with 5-key fallback. Normal REJECT is a final decision.
 
     Fallback occurs ONLY for transport/API/configuration failures or incomplete
@@ -643,14 +651,47 @@ def gemini_json(system_text, user_payload, max_output_tokens=700):
 
 def gemini_validate(analysis):
     prompt={
+      'task': 'Build your OWN independent score and your OWN Entry/SL/TP1/TP2/TP3 from the raw candles and structure below. Do NOT just rubber-stamp the quant numbers -- treat quant_score/quant_entry/quant_sl/quant_tp1/quant_tp2/quant_tp3 as a reference only, not ground truth.',
       'symbol':analysis['symbol'], 'framework':analysis['framework'], 'timeframes':analysis['timeframes'],
-      'direction_candidate':analysis['direction'], 'quant_score':analysis['score'],
-      'entry':analysis['entry'],'sl':analysis['sl'],'tp1':analysis['tp1'],'tp2':analysis['tp2'],'tp3':analysis['tp3'],'rr':analysis['rr'],
-      'reasons':analysis['reasons'],
+      'direction_candidate':analysis['direction'],
+      'quant_score':analysis['score'],
+      'quant_entry':analysis['entry'],'quant_sl':analysis['sl'],'quant_tp1':analysis['tp1'],'quant_tp2':analysis['tp2'],'quant_tp3':analysis['tp3'],'quant_rr':analysis['rr'],
+      'quant_reasons':analysis['reasons'],
       'timeframe_analysis':{k:{x:v for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()},
-      'raw_ohlcv_candles': analysis.get('candles', {})
+      'raw_ohlcv_candles': analysis.get('candles', {}),
+      # Python's own read of structure -- reference only, Gemini must verify against raw candles itself.
+      'python_structure_flags': analysis.get('structure_flags', {}),
+      'scoring_factors_reference_max_points': {
+          'htf_bias_1h': 20, 'trend': 10, 'liquidity_sweep': 15, 'bos': 15, 'choch': 10,
+          'order_block': 10, 'fvg': 5, 'volume_expansion': 10, 'rsi_momentum': 5,
+          'risk_reward_ge_1_2': 5, 'crt': 5, 'tbs': 5,
+          'single_candle_pattern': 3, 'double_candle_pattern': 3, 'triple_candle_pattern': 4
+      }
     }
-    system="""You are the FINAL VALIDATOR for a crypto trading research bot. Review the supplied raw OHLCV candles and structured multi-timeframe analysis. Do not invent market data. Check 1H/15M/5M structure, SMC/liquidity/BOS, CRT, TBS, candlestick evidence, direction, and the proposed Entry/SL/TP1/TP2/TP3 levels. Approve only when the setup is coherent and the risk plan is valid. Return JSON only: {\"decision\":\"APPROVE\"|\"REJECT\",\"confidence\":0-100,\"reason\":\"short reason\",\"risk_note\":\"short note\",\"entry_valid\":true|false,\"sl_valid\":true|false,\"tp1_valid\":true|false,\"tp2_valid\":true|false,\"tp3_valid\":true|false}."""
+    system="""You are an INDEPENDENT SECOND ANALYST for a crypto trading research bot -- not a rubber-stamp validator.
+Using ONLY the supplied raw OHLCV candles (1H/15M/5M) and structured multi-timeframe data, build your OWN independent read of this setup by checking EACH of the following yourself directly against the raw candles:
+- HTF Bias
+- Trend
+- Liquidity Sweep
+- BOS (Break of Structure)
+- CHOCH (Change of Character)
+- Order Block
+- FVG (Fair Value Gap)
+- Volume Expansion
+- RSI Momentum
+- CRT
+- TBS
+- Single Candle Pattern
+- Double Candle Pattern
+- Triple Candle Pattern
+
+python_structure_flags is Python's own detection of CHoCH/FVG/CRT/TBS/candle patterns -- treat it as a reference only, not ground truth; verify or overturn it yourself from raw_ohlcv_candles.
+
+Score it yourself (0-100) using the factor set above (max points per factor are given in scoring_factors_reference_max_points). Do not copy quant_score -- compute your own from what you actually see in the candles.
+Propose your OWN Entry, SL, TP1, TP2, TP3 for whichever direction your analysis supports (it may agree or disagree with direction_candidate), derived purely from the raw candles/structure you were given -- do not just echo the quant levels.
+Set decision to APPROVE only if your own analysis genuinely supports a valid, coherent trade with correct level ordering and R:R >= 1:2. Otherwise REJECT.
+Return JSON only, no markdown fences:
+{"decision":"APPROVE"|"REJECT","score":0-100,"direction":"LONG"|"SHORT","confidence":0-100,"entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,"htf_bias":"BULLISH"|"BEARISH"|"NEUTRAL","bos_detected":true|false,"choch_detected":true|false,"order_block_detected":true|false,"fvg_detected":true|false,"crt_detected":true|false,"tbs_detected":true|false,"candle_patterns":["pattern_name", "..."],"reason":"short reason","risk_note":"short note"}."""
     return gemini_json(system, prompt)
 
 # ----------------------------- Trades ---------------------------------
@@ -767,19 +808,44 @@ def scan_once(force=False):
             with DB_LOCK:
                 con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,'GEMINI_ERROR',1,reason)); con.commit(); con.close()
             result['symbols'][best_symbol].update({'decision':'GEMINI_ERROR','gemini':True,'ai':{'error':reason},'reason':reason}); return result
-        approved=False; reason=ai.get('reason','Gemini rejected')
+        # Gemini now scores independently -- it must beat (or match) the quant score
+        # on ITS OWN read of the market before its OWN Entry/SL/TP levels are used.
+        try:
+            gemini_score=float(ai.get('score', ai.get('confidence', 0)) or 0)
+        except (TypeError, ValueError):
+            gemini_score=0.0
+        approved=False; trade_plan=best; reason=ai.get('reason','Gemini rejected')
         if str(ai.get('decision','REJECT')).upper()=='APPROVE':
-            ok,why=_final_level_check(best['direction'],best['entry'],best['sl'],best['tp1'],best['tp2'],best['tp3'])
-            if ok: approved=True
-            else: reason=f'Gemini approved but failed hard level check: {why}'
+            if gemini_score >= best_score:
+                g_direction=str(ai.get('direction') or best['direction']).upper()
+                try:
+                    g_entry=float(ai['entry']); g_sl=float(ai['sl'])
+                    g_tp1=float(ai['tp1']); g_tp2=float(ai['tp2']); g_tp3=float(ai['tp3'])
+                except (KeyError, TypeError, ValueError):
+                    reason='Gemini approved but returned invalid/missing trade levels'
+                else:
+                    ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
+                    if ok:
+                        approved=True
+                        trade_plan=dict(best)
+                        trade_plan.update({'direction':g_direction,'entry':g_entry,'sl':g_sl,
+                                            'tp1':g_tp1,'tp2':g_tp2,'tp3':g_tp3,
+                                            'rr':abs(g_tp3-g_entry)/max(abs(g_entry-g_sl),1e-12)})
+                        reason=ai.get('reason', f'Gemini score {gemini_score:.0f} >= quant score {best_score:.0f}')
+                    else:
+                        reason=f'Gemini approved but failed hard level check: {why}'
+            else:
+                reason=f'Gemini score {gemini_score:.0f} below quant score {best_score:.0f}; trade rejected'
+        else:
+            reason=ai.get('reason', f'Gemini score {gemini_score:.0f} below quant score {best_score:.0f}')
         decision='APPROVED' if approved else 'REJECTED'
         with DB_LOCK:
-            con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,decision,1,reason)); con.commit(); con.close()
-        result['symbols'][best_symbol].update({'decision':decision,'gemini':True,'ai':ai,'reason':reason})
+            con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,decision,1,f'[Gemini score {gemini_score:.0f}] {reason}')); con.commit(); con.close()
+        result['symbols'][best_symbol].update({'decision':decision,'gemini':True,'ai':ai,'gemini_score':gemini_score,'reason':reason})
         # Telegram: ONLY an actually created trade. No score spam / no rejects / no waits.
         if approved:
-            tid=insert_trade(best,ai)
-            telegram_send(f'🚨 *SMC AI PRO — {best["direction"]} {best_symbol}*\nTrade #{tid}\nQuant Score: `{best_score:.0f}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{best["entry"]:.6f}`\nSL: `{best["sl"]:.6f}`\nTP1: `{best["tp1"]:.6f}`\nTP2: `{best["tp2"]:.6f}`\nTP3: `{best["tp3"]:.6f}`\nR:R: `1:{best["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
+            tid=insert_trade(trade_plan,ai)
+            telegram_send(f'🚨 *SMC AI PRO — {trade_plan["direction"]} {best_symbol}*\nTrade #{tid}\nQuant Score: `{best_score:.0f}/100`\nGemini Score: `{gemini_score:.0f}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{trade_plan["entry"]:.6f}`\nSL: `{trade_plan["sl"]:.6f}`\nTP1: `{trade_plan["tp1"]:.6f}`\nTP2: `{trade_plan["tp2"]:.6f}`\nTP3: `{trade_plan["tp3"]:.6f}`\nR:R: `1:{trade_plan["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
         return result
     finally:
         LAST_SCAN=now_utc(); SCAN_LOCK.release()
@@ -929,23 +995,4 @@ def setup_status():
 
 
 
-def final_trade_level_check(direction, entry, sl, tp1, tp2, tp3):
-    try:
-        entry, sl, tp1, tp2, tp3 = map(float, (entry, sl, tp1, tp2, tp3))
-    except (TypeError, ValueError):
-        return False, "Invalid numeric trade levels"
-    direction = str(direction).upper()
-    if direction == "LONG":
-        if not (sl < entry < tp1 <= tp2 <= tp3):
-            return False, "Invalid LONG level ordering"
-    elif direction == "SHORT":
-        if not (sl > entry > tp1 >= tp2 >= tp3):
-            return False, "Invalid SHORT level ordering"
-    else:
-        return False, "Invalid direction"
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return False, "Zero risk"
-    if abs(tp2-entry)/risk < 2:
-        return False, "R:R below 1:2"
-    return True, "PASS"
+
