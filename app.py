@@ -231,6 +231,14 @@ def init_db():
             key TEXT PRIMARY KEY, value TEXT
         );
         ''')
+        # Migration: older DBs won't have this column yet. SQLite has no
+        # "ADD COLUMN IF NOT EXISTS", so try and swallow the duplicate-column
+        # error. Stores which scoring factors fired on each trade so we can
+        # later backtest which factor combinations actually win.
+        try:
+            con.execute('ALTER TABLE trades ADD COLUMN factors_json TEXT')
+        except sqlite3.OperationalError:
+            pass
         con.commit(); con.close()
 
 def state_get(key, default=None):
@@ -604,10 +612,31 @@ def build_analysis(symbol):
     rr=abs(tp3-price)/max(abs(price-sl),1e-12)
     if rr>=2: scores[direction]+=5; reasons[direction].append('R:R >= 1:2')
     score=min(100,scores[direction])
+    # Canonical per-factor booleans for this trade, derived from the reasons
+    # that actually fired for the winning direction. Stored on every trade so
+    # later backtesting can measure each factor's real win rate instead of
+    # guessing from the weight table.
+    reason_text=' | '.join(reasons[direction])
+    factor_flags={
+        'htf_bias': 'HTF ' in reason_text,
+        'trend_regime': 'trending regime' in reason_text,
+        'liquidity_sweep': 'liquidity sweep' in reason_text,
+        'bos': ' BOS' in reason_text,
+        'order_block': 'order-block zone' in reason_text,
+        'choch': 'CHoCH' in reason_text,
+        'fvg': 'inside FVG' in reason_text,
+        'crt': 'CRT' in reason_text,
+        'tbs': 'TBS' in reason_text,
+        'candle_pattern': 'candle pattern' in reason_text,
+        'volume_expansion': 'volume expansion' in reason_text,
+        'momentum': 'RSI' in reason_text,
+        'rr_ge_2': 'R:R >= 1:2' in reason_text,
+    }
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
         'direction':direction,'score':score,'price':price,'entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':rr,
         'reasons':reasons[direction], 'tf':{tf1:a1,tf2:a2,tf3:a3}, 'candles':{tf1:c1[-20:],tf2:c2[-20:],tf3:c3[-20:]},
+        'factor_flags':factor_flags,
         'structure_flags':{
             'choch':choch,
             'fvg':{d:(fvg_hits[d] if fvg_hits.get(d) else None) for d in ('LONG','SHORT')},
@@ -752,9 +781,22 @@ Return JSON only, no markdown fences:
 
 # ----------------------------- Trades ---------------------------------
 def insert_trade(a, ai):
+    # Store quant factor flags + Gemini's own factor detections together so
+    # closed trades can later be backtested per-factor (see /api/backtest).
+    factors_json=json.dumps({
+        'quant': a.get('factor_flags', {}),
+        'quant_score': a.get('score'),
+        'gemini': {
+            'score': ai.get('score'), 'confidence': ai.get('confidence'),
+            'htf_bias': ai.get('htf_bias'), 'bos': ai.get('bos_detected'),
+            'choch': ai.get('choch_detected'), 'order_block': ai.get('order_block_detected'),
+            'fvg': ai.get('fvg_detected'), 'crt': ai.get('crt_detected'),
+            'tbs': ai.get('tbs_detected'), 'candle_patterns': ai.get('candle_patterns'),
+        }
+    })
     with DB_LOCK:
-        con=db(); cur=con.execute('''INSERT INTO trades(symbol,direction,entry,sl,tp1,tp2,tp3,score,ai_confidence,ai_reason,framework,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
-          (a['symbol'],a['direction'],a['entry'],a['sl'],a['tp1'],a['tp2'],a['tp3'],a['score'],int(ai.get('confidence',0)),ai.get('reason',''),FRAMEWORK,now_utc()))
+        con=db(); cur=con.execute('''INSERT INTO trades(symbol,direction,entry,sl,tp1,tp2,tp3,score,ai_confidence,ai_reason,framework,created_at,factors_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+          (a['symbol'],a['direction'],a['entry'],a['sl'],a['tp1'],a['tp2'],a['tp3'],a['score'],int(ai.get('confidence',0)),ai.get('reason',''),FRAMEWORK,now_utc(),factors_json))
         con.commit(); tid=cur.lastrowid; con.close()
     return tid
 
@@ -999,6 +1041,83 @@ def stats():
 def send_trade_summary():
     s=stats(); telegram_send(f'📊 *TRADE STATS*\nTotal: `{s["total"]}`\nOpen: `{s["open"]}`\nWins: `{s["wins"]}`\nLosses: `{s["losses"]}`\nPartial: `{s["partials"]}`\nWin rate: `{s["win_rate"]}%`')
 
+# ----------------------------- Backtest / factor stats -----------------
+FACTOR_KEYS = ['htf_bias','trend_regime','liquidity_sweep','bos','order_block','choch',
+               'fvg','crt','tbs','candle_pattern','volume_expansion','momentum','rr_ge_2']
+
+def _trade_r_multiple(row):
+    """R-multiple actually achieved by a closed trade. This system does not
+    book partial profit at TP1/TP2 -- it only exits fully at TP3 or SL -- so
+    anything that ends in an SL touch (even after tagging a TP along the way)
+    realizes -1R, and only a full TP3_WIN realizes the positive reward."""
+    try:
+        entry=float(row['entry']); sl=float(row['sl'])
+    except (TypeError, ValueError):
+        return None
+    risk=abs(entry-sl)
+    if risk <= 0:
+        return None
+    if row['final_result']=='TP3_WIN':
+        try:
+            tp3=float(row['tp3'])
+        except (TypeError, ValueError):
+            return None
+        return abs(tp3-entry)/risk
+    if row['sl_hit']:
+        return -1.0
+    return None
+
+def factor_backtest_report(min_sample=5):
+    """Splits every CLOSED trade that has recorded factors into 'factor
+    present' vs 'factor absent' groups per scoring factor, and reports win
+    rate + average R-multiple for each side. This is the actual data-driven
+    answer to 'which factor combo wins more' -- not a guess."""
+    with DB_LOCK:
+        con=db()
+        rows=[dict(x) for x in con.execute(
+            "SELECT * FROM trades WHERE status='CLOSED' AND factors_json IS NOT NULL AND factors_json != ''"
+        ).fetchall()]
+        con.close()
+    report={'total_closed_with_factors':len(rows),'min_sample_per_side':min_sample,'factors':{}}
+    if not rows:
+        report['note']=('No closed trades with recorded factors yet. Factor tags are only '
+                         'saved on trades created after this backtest feature was added -- '
+                         'let the bot run and accumulate closed trades, then call this again.')
+        return report
+
+    def _group_stats(group):
+        n=len(group)
+        if n==0:
+            return {'trades':0,'win_rate':None,'avg_r':None}
+        wins=sum(1 for r in group if r['final_result']=='TP3_WIN')
+        r_vals=[v for v in (_trade_r_multiple(r) for r in group) if v is not None]
+        return {
+            'trades':n,
+            'win_rate':round(wins/n*100,1),
+            'avg_r':round(sum(r_vals)/len(r_vals),2) if r_vals else None,
+        }
+
+    for key in FACTOR_KEYS:
+        with_f, without_f = [], []
+        for r in rows:
+            try:
+                flags=(json.loads(r['factors_json']) or {}).get('quant',{})
+            except Exception:
+                flags={}
+            (with_f if flags.get(key) else without_f).append(r)
+        w=_group_stats(with_f); wo=_group_stats(without_f)
+        report['factors'][key]={
+            'with_factor':w, 'without_factor':wo,
+            'edge_win_rate_pts': round(w['win_rate']-wo['win_rate'],1) if (w['win_rate'] is not None and wo['win_rate'] is not None) else None,
+            'reliable_sample': w['trades']>=min_sample and wo['trades']>=min_sample,
+        }
+    report['factors']=dict(sorted(
+        report['factors'].items(),
+        key=lambda kv: (kv[1]['edge_win_rate_pts'] if kv[1]['edge_win_rate_pts'] is not None else -999),
+        reverse=True
+    ))
+    return report
+
 # ----------------------------- Web -----------------------------------
 
 @app.get('/telegram-status')
@@ -1034,6 +1153,14 @@ def api_scans():
         con=db(); rows=[dict(x) for x in con.execute('SELECT * FROM scans ORDER BY id DESC LIMIT 200').fetchall()]; con.close()
     return jsonify(rows)
 
+@app.get('/api/backtest')
+def api_backtest():
+    """Data-driven factor win-rate report. See procedure/explanation given
+    alongside this endpoint -- min_sample query param controls how many
+    trades per side are required before a factor is marked 'reliable'."""
+    min_sample=max(1,int(request.args.get('min_sample',5)))
+    return jsonify(factor_backtest_report(min_sample))
+
 @app.post('/api/reset')
 def api_reset():
     with DB_LOCK:
@@ -1048,7 +1175,22 @@ def dashboard():
         con=db(); trades=[dict(x) for x in con.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 50').fetchall()]; scans=[dict(x) for x in con.execute('SELECT * FROM scans ORDER BY id DESC LIMIT 30').fetchall()]; con.close()
     rows=''.join(f'<tr><td>#{t["id"]}</td><td>{t["symbol"]}</td><td>{t["direction"]}</td><td>{t["score"]}</td><td>{t["status"]}</td><td>{t["highest_tp"] or 0}</td><td>{t["final_result"] or "—"}</td></tr>' for t in trades)
     scanrows=''.join(f'<tr><td>{x["time"]}</td><td>{x["symbol"]}</td><td>{x["score"]}</td><td>{x["decision"]}</td><td>{"YES" if x["gemini_called"] else "NO"}</td><td>{x["reason"] or "—"}</td></tr>' for x in scans)
-    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>body{{font-family:Arial;background:#080b0f;color:#d7e0ea;margin:0;padding:24px}}h1{{color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:#11161d;border:1px solid #252d36;border-radius:12px;padding:16px}}.n{{font-size:25px;color:#fff;font-weight:700}}table{{width:100%;border-collapse:collapse;margin-top:12px;background:#0e1319}}th,td{{padding:9px;border-bottom:1px solid #202730;text-align:left;font-size:12px}}td:last-child{{color:#9aa7b5;max-width:340px}}button{{padding:10px 14px;border:0;border-radius:8px;background:#ef4444;color:#fff;font-weight:700;cursor:pointer}}a{{color:#60a5fa}}section{{margin-top:28px}}</style></head><body><h1>⚡ SMC AI PRO</h1><p>Framework: <b>{FRAMEWORK}</b> · Timeframes: <b>{" → ".join(TIMEFRAMES)}</b> · Scanner: <b>{"ON" if scanner_is_active() else "OFF"}</b> · Tracker: <b>ON</b></p><div class="grid"><div class="card">Total<div class="n">{s['total']}</div></div><div class="card">Open<div class="n">{s['open']}</div></div><div class="card">Wins<div class="n">{s['wins']}</div></div><div class="card">Losses<div class="n">{s['losses']}</div></div><div class="card">Partial<div class="n">{s['partials']}</div></div><div class="card">Win rate<div class="n">{s['win_rate']}%</div></div></div><section><button onclick="resetAll()">Reset All Trade Statistics</button> <a href="/health">Health</a> <a href="/api/trades">Trades JSON</a> <a href="/run-now">Run Now</a></section><section><h2>Trade Tracking</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th><th>Result</th></tr>{rows or '<tr><td colspan="7">No tracked trades</td></tr>'}</table></section><section><h2>Scan Log</h2><table><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>Gemini</th><th>Reason</th></tr>{scanrows or '<tr><td colspan="6">No scans</td></tr>'}</table></section><script>async function resetAll(){{if(!confirm('Delete ALL trades and scan history?'))return;let r=await fetch('/api/reset',{{method:'POST'}});if(r.ok)location.reload();else alert('Reset failed');}}</script></body></html>'''
+    bt=factor_backtest_report()
+    if bt.get('note'):
+        btrows=f'<tr><td colspan="5">{bt["note"]}</td></tr>'
+    else:
+        def _cell(g):
+            if g['trades']==0: return '—'
+            r=f"{g['win_rate']}% ({g['trades']})"
+            if g['avg_r'] is not None: r+=f" · avg {g['avg_r']}R"
+            return r
+        btrows=''.join(
+            f'<tr><td>{k.replace("_"," ")}</td><td>{_cell(v["with_factor"])}</td><td>{_cell(v["without_factor"])}</td>'
+            f'<td>{("+" if (v["edge_win_rate_pts"] or 0)>=0 else "")}{v["edge_win_rate_pts"]}pt</td>'
+            f'<td>{"✅" if v["reliable_sample"] else "low sample"}</td></tr>'
+            for k,v in bt['factors'].items()
+        )
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>body{{font-family:Arial;background:#080b0f;color:#d7e0ea;margin:0;padding:24px}}h1{{color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:#11161d;border:1px solid #252d36;border-radius:12px;padding:16px}}.n{{font-size:25px;color:#fff;font-weight:700}}table{{width:100%;border-collapse:collapse;margin-top:12px;background:#0e1319}}th,td{{padding:9px;border-bottom:1px solid #202730;text-align:left;font-size:12px}}td:last-child{{color:#9aa7b5;max-width:340px}}button{{padding:10px 14px;border:0;border-radius:8px;background:#ef4444;color:#fff;font-weight:700;cursor:pointer}}a{{color:#60a5fa}}section{{margin-top:28px}}</style></head><body><h1>⚡ SMC AI PRO</h1><p>Framework: <b>{FRAMEWORK}</b> · Timeframes: <b>{" → ".join(TIMEFRAMES)}</b> · Scanner: <b>{"ON" if scanner_is_active() else "OFF"}</b> · Tracker: <b>ON</b></p><div class="grid"><div class="card">Total<div class="n">{s['total']}</div></div><div class="card">Open<div class="n">{s['open']}</div></div><div class="card">Wins<div class="n">{s['wins']}</div></div><div class="card">Losses<div class="n">{s['losses']}</div></div><div class="card">Partial<div class="n">{s['partials']}</div></div><div class="card">Win rate<div class="n">{s['win_rate']}%</div></div></div><section><button onclick="resetAll()">Reset All Trade Statistics</button> <a href="/health">Health</a> <a href="/api/trades">Trades JSON</a> <a href="/api/backtest">Backtest JSON</a> <a href="/run-now">Run Now</a></section><section><h2>Trade Tracking</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th><th>Result</th></tr>{rows or '<tr><td colspan="7">No tracked trades</td></tr>'}</table></section><section><h2>Factor Backtest — closed trades only ({bt.get("total_closed_with_factors",0)} sampled)</h2><table><tr><th>Factor</th><th>Win rate WITH it</th><th>Win rate WITHOUT it</th><th>Edge</th><th>Sample</th></tr>{btrows or '<tr><td colspan="5">No data yet</td></tr>'}</table></section><section><h2>Scan Log</h2><table><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>Gemini</th><th>Reason</th></tr>{scanrows or '<tr><td colspan="6">No scans</td></tr>'}</table></section><script>async function resetAll(){{if(!confirm('Delete ALL trades and scan history?'))return;let r=await fetch('/api/reset',{{method:'POST'}});if(r.ok)location.reload();else alert('Reset failed');}}</script></body></html>'''
 
 # ----------------------------- Startup --------------------------------
 init_db()
