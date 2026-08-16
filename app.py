@@ -121,9 +121,12 @@ def build_pattern_score(patterns, direction):
         "dark_cloud_cover","tweezer_top","evening_star","three_black_crows",
         "bearish_marubozu"
     }
+    # Capped low on purpose -- candle patterns are the weakest, noisiest
+    # standalone confluence in SMC/ICT community consensus; kept as a minor
+    # tiebreaker rather than a core scoring factor.
     if direction == "LONG":
-        return min(10, 2 * len(set(patterns) & bullish)) - min(4, len(set(patterns) & bearish))
-    return min(10, 2 * len(set(patterns) & bearish)) - min(4, len(set(patterns) & bullish))
+        return min(6, 2 * len(set(patterns) & bullish)) - min(3, len(set(patterns) & bearish))
+    return min(6, 2 * len(set(patterns) & bearish)) - min(3, len(set(patterns) & bullish))
 import os, re, json, time, math, sqlite3, threading, logging
 from datetime import datetime, timezone
 from typing import Any
@@ -262,6 +265,36 @@ def telegram_send(text):
 
 def tf_label(tf):
     return tf.upper().replace('H','H').replace('M','M')
+
+def fmt_price(v):
+    """Adaptive-precision price formatting.
+
+    A fixed '.6f' truncates micro-price coins (PEPE, SHIB, BONK, ...) down to
+    a handful of decimals, e.g. 0.0000024789 -> 0.000002, which silently
+    destroys the real entry/SL/TP level. This scales decimal places to the
+    coin's own magnitude so the real level is always shown, then trims
+    trailing zeros for readability.
+    """
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    av = abs(v)
+    if av == 0:
+        return '0'
+    if av >= 100:
+        d = 2
+    elif av >= 1:
+        d = 4
+    elif av >= 0.01:
+        d = 6
+    else:
+        # keep ~5 significant figures past the first nonzero digit
+        d = max(8, -int(math.floor(math.log10(av))) + 5)
+    s = f'{v:.{d}f}'
+    if '.' in s:
+        s = s.rstrip('0').rstrip('.')
+    return s
 
 # ----------------------------- Market Data / Exchange Fallbacks --------
 _INTERVAL_SECONDS = {
@@ -438,7 +471,7 @@ def detect_tbs(candles):
     return False, "No TBS confirmation"
 
 def tbs_crt_bonus(candles, direction):
-    """+5 each for CRT/TBS confirmation aligned with `direction`, capped at 10."""
+    """+4 each for CRT/TBS confirmation aligned with `direction`, capped at 8."""
     bonus, reasons = 0, []
     for detector in (detect_crt, detect_tbs):
         ok, reason = detector(candles)
@@ -446,9 +479,9 @@ def tbs_crt_bonus(candles, direction):
             bullish = "bullish" in reason.lower()
             aligned = (direction == "LONG" and bullish) or (direction == "SHORT" and not bullish)
             if aligned:
-                bonus += 5
+                bonus += 4
                 reasons.append(reason)
-    return min(bonus, 10), reasons
+    return min(bonus, 8), reasons
 
 
 # ---------------- CHOCH + FVG detection ----------------
@@ -486,58 +519,81 @@ def build_analysis(symbol):
     c1=fetch_klines(symbol,tf1,160); c2=fetch_klines(symbol,tf2,160); c3=fetch_klines(symbol,tf3,160)
     a1,a2,a3=analyze_tf(c1),analyze_tf(c2),analyze_tf(c3)
     # Score both directions. Require MTF alignment, but allow one lower TF disagreement if setup is strong.
+    #
+    # Weights below were rebalanced against SMC/ICT community backtests and
+    # published guides (liquidity sweep + a body-close BOS are consistently
+    # cited as the strongest, most independently-predictive confluences;
+    # CHoCH is repeatedly described as an early warning/reversal *alert*
+    # rather than a standalone entry trigger, so it should never weigh as
+    # much as a confirmed BOS; a lone Order Block with nothing else behind
+    # it is called out as the single most common false-signal source --
+    # "most order blocks fail... only trade the ones with confluence"). See
+    # notes inline at each factor. Treat this as a documented starting point,
+    # not a guarantee -- forward-test / backtest before trusting it with size.
     scores={'LONG':0,'SHORT':0}; reasons={'LONG':[],'SHORT':[]}
-    # HTF bias 20
-    if a1['bias']=='BULLISH': scores['LONG']+=20; reasons['LONG'].append('HTF bullish')
-    if a1['bias']=='BEARISH': scores['SHORT']+=20; reasons['SHORT'].append('HTF bearish')
-    # Market regime 10: trend strength proxy from EMA separation / ATR.
+    # HTF bias 18
+    if a1['bias']=='BULLISH': scores['LONG']+=18; reasons['LONG'].append('HTF bullish')
+    if a1['bias']=='BEARISH': scores['SHORT']+=18; reasons['SHORT'].append('HTF bearish')
+    # Market regime 8: trend strength proxy from EMA separation / ATR.
     sep=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
     if sep >= 1.0:
-        for d in scores: scores[d]+=10 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
+        for d in scores: scores[d]+=8 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
         if a1['bias'] in ('BULLISH','BEARISH'): reasons[a1['bias'].replace('BULLISH','LONG').replace('BEARISH','SHORT')].append('trending regime')
-    # Liquidity sweep 15
-    if a2['bull_sweep']: scores['LONG']+=15; reasons['LONG'].append('sell-side liquidity sweep')
-    if a2['bear_sweep']: scores['SHORT']+=15; reasons['SHORT'].append('buy-side liquidity sweep')
-    # BOS / CHoCH 15
-    if a2['bull_bos']: scores['LONG']+=15; reasons['LONG'].append('bullish BOS')
-    if a2['bear_bos']: scores['SHORT']+=15; reasons['SHORT'].append('bearish BOS')
-    # OB/FVG proxy 10 when price is near a detected zone.
+    # Liquidity sweep 20: raised -- this is the confluence backtested SMC
+    # communities cite most consistently as predictive on its own.
+    if a2['bull_sweep']: scores['LONG']+=20; reasons['LONG'].append('sell-side liquidity sweep')
+    if a2['bear_sweep']: scores['SHORT']+=20; reasons['SHORT'].append('buy-side liquidity sweep')
+    # BOS 18: raised -- our bull_bos/bear_bos are already close-confirmed
+    # (not wick-only), which is the standard SMC guides insist on for a
+    # break of structure to count at all.
+    if a2['bull_bos']: scores['LONG']+=18; reasons['LONG'].append('bullish BOS')
+    if a2['bear_bos']: scores['SHORT']+=18; reasons['SHORT'].append('bearish BOS')
+    # Order Block 8 -- lowered, and now GATED on confluence. An OB with
+    # nothing backing it is the most commonly cited false-signal source;
+    # it only scores here if the same-direction liquidity sweep already
+    # fired OR an FVG in the same direction exists nearby.
     for d in ('LONG','SHORT'):
         z=detect_zone(c2,d)
         if z and z['low'] <= a3['price'] <= z['high']*1.002:
-            scores[d]+=10; reasons[d].append('price at order-block zone')
-    # CHOCH 10: reversal break of the last opposite-side swing point.
+            sweep_ok = a2['bull_sweep'] if d=='LONG' else a2['bear_sweep']
+            fvg_ok = detect_fvg(c2,d) is not None
+            if sweep_ok or fvg_ok:
+                scores[d]+=8; reasons[d].append('price at order-block zone (confluence-backed)')
+    # CHOCH 6: lowered -- SMC guides treat CHoCH as an early reversal
+    # *warning*, not a confirmed entry trigger the way BOS is.
     choch=detect_choch(c2, a2['bias'])
-    if choch['bull_choch']: scores['LONG']+=10; reasons['LONG'].append('bullish CHoCH')
-    if choch['bear_choch']: scores['SHORT']+=10; reasons['SHORT'].append('bearish CHoCH')
-    # FVG 5: price trading back into an unfilled fair value gap.
+    if choch['bull_choch']: scores['LONG']+=6; reasons['LONG'].append('bullish CHoCH')
+    if choch['bear_choch']: scores['SHORT']+=6; reasons['SHORT'].append('bearish CHoCH')
+    # FVG 6: price trading back into an unfilled fair value gap.
     fvg_hits={}
     for d in ('LONG','SHORT'):
         fvg=detect_fvg(c2,d)
         fvg_hits[d]=fvg
         if fvg and fvg['low'] <= a3['price'] <= fvg['high']*1.002:
-            scores[d]+=5; reasons[d].append('price inside FVG')
-    # CRT + TBS confirmation (lower-timeframe sweep/reclaim), up to 10.
+            scores[d]+=6; reasons[d].append('price inside FVG')
+    # CRT + TBS confirmation (lower-timeframe sweep/reclaim), up to 8.
     crt_tbs_hits={}
     for d in ('LONG','SHORT'):
         bonus,breasons=tbs_crt_bonus(c3,d)
         crt_tbs_hits[d]={'bonus':bonus,'reasons':breasons}
         if bonus:
             scores[d]+=bonus; reasons[d].extend(breasons)
-    # Candle patterns (single/double/triple) on the lowest timeframe, up to 10 / -4.
+    # Candle patterns (single/double/triple) on the lowest timeframe, up to 6 / -3.
+    # Lowered -- candle patterns are the weakest/noisiest confluence on their
+    # own per SMC community consensus; kept as a minor tiebreaker only.
     patterns=detect_candlestick_patterns(c3)
     for d in ('LONG','SHORT'):
         pbonus=build_pattern_score(patterns,d)
         if pbonus:
             scores[d]=max(0,scores[d]+pbonus)
             if pbonus>0: reasons[d].append(f'candle pattern(s): {", ".join(patterns)}')
-    # Volume 10
+    # Volume 8
     if a3['volume_ratio']>=1.2:
         d='LONG' if a3['bull_mom'] else 'SHORT' if a3['bear_mom'] else None
-        if d: scores[d]+=10; reasons[d].append('volume expansion')
-    # Momentum 5
-    if a3['bull_mom']: scores['LONG']+=5; reasons['LONG'].append(f'RSI {a3["rsi"]:.0f}')
-    if a3['bear_mom']: scores['SHORT']+=5; reasons['SHORT'].append(f'RSI {a3["rsi"]:.0f}')
+        if d: scores[d]+=8; reasons[d].append('volume expansion')
+    # Momentum 4
+    if a3['bull_mom']: scores['LONG']+=4; reasons['LONG'].append(f'RSI {a3["rsi"]:.0f}')
+    if a3['bear_mom']: scores['SHORT']+=4; reasons['SHORT'].append(f'RSI {a3["rsi"]:.0f}')
     # R:R is calculated after entry/SL/TP plan.
     direction=max(scores, key=scores.get); base=scores[direction]
     price=a3['price']; a=a3['atr'] or (price*0.005)
@@ -662,10 +718,10 @@ def gemini_validate(analysis):
       # Python's own read of structure -- reference only, Gemini must verify against raw candles itself.
       'python_structure_flags': analysis.get('structure_flags', {}),
       'scoring_factors_reference_max_points': {
-          'htf_bias_1h': 20, 'trend': 10, 'liquidity_sweep': 15, 'bos': 15, 'choch': 10,
-          'order_block': 10, 'fvg': 5, 'volume_expansion': 10, 'rsi_momentum': 5,
-          'risk_reward_ge_1_2': 5, 'crt': 5, 'tbs': 5,
-          'single_candle_pattern': 3, 'double_candle_pattern': 3, 'triple_candle_pattern': 4
+          'htf_bias_1h': 18, 'trend': 8, 'liquidity_sweep': 20, 'bos': 18, 'choch': 6,
+          'order_block': 8, 'fvg': 6, 'volume_expansion': 8, 'rsi_momentum': 4,
+          'risk_reward_ge_1_2': 5, 'crt': 4, 'tbs': 4,
+          'single_candle_pattern': 2, 'double_candle_pattern': 2, 'triple_candle_pattern': 3
       }
     }
     system="""You are an INDEPENDENT SECOND ANALYST for a crypto trading research bot -- not a rubber-stamp validator.
@@ -710,29 +766,55 @@ def has_open_similar(symbol,direction):
 def check_trade(row, candle):
     direction=row['direction']; high=candle['high']; low=candle['low']; entry=row['entry']; sl=row['sl']
     status=row['status']; htp=row['highest_tp'] or 0
+    just_entered=False
     if status=='WAITING_ENTRY':
-        if low <= entry <= high: status='OPEN'
+        if low <= entry <= high: status='OPEN'; just_entered=True
         else: return None
     tp_hits=[]
     for n,key in [(1,'tp1'),(2,'tp2'),(3,'tp3')]:
         if row[key] is not None and ((direction=='LONG' and high>=row[key]) or (direction=='SHORT' and low<=row[key])): tp_hits.append(n)
     sl_hit=(low<=sl) if direction=='LONG' else (high>=sl)
     if sl_hit and tp_hits:
-        new=max([htp]+tp_hits); return {'status':'CLOSED','highest_tp':new,'tp1_hit':int(new>=1),'tp2_hit':int(new>=2),'tp3_hit':int(new>=3),'sl_hit':1,'final_result':f'TP{new}_AND_SL_SAME_CANDLE','close_time':now_utc()}
+        new=max([htp]+tp_hits)
+        out={'status':'CLOSED','highest_tp':new,'tp1_hit':int(new>=1),'tp2_hit':int(new>=2),'tp3_hit':int(new>=3),'sl_hit':1,'final_result':f'TP{new}_AND_SL_SAME_CANDLE','close_time':now_utc()}
+        if just_entered: out['entry_time']=now_utc()
+        return out
     if sl_hit:
         result='SL_LOSS' if htp==0 else f'TP{htp}_HIT_THEN_SL'
-        return {'status':'CLOSED','sl_hit':1,'final_result':result,'close_time':now_utc()}
+        out={'status':'CLOSED','sl_hit':1,'final_result':result,'close_time':now_utc()}
+        if just_entered: out['entry_time']=now_utc()
+        return out
     if tp_hits:
         new=max([htp]+tp_hits)
         u={'status':'OPEN','highest_tp':new,'tp1_hit':int(new>=1),'tp2_hit':int(new>=2),'tp3_hit':int(new>=3),'last_checked':now_utc()}
+        if just_entered: u['entry_time']=now_utc()
         if new>=3: u.update({'status':'CLOSED','final_result':'TP3_WIN','close_time':now_utc()})
         return u
-    return {'status':status,'last_checked':now_utc()}
+    out={'status':status,'last_checked':now_utc()}
+    if just_entered: out['entry_time']=now_utc()
+    return out
 
 
-def fetch_tracking_candle(symbol, limit=3):
-    """Dedicated 1-minute OHLCV feed used only for TP/SL monitoring."""
-    return fetch_klines(symbol, TRACK_TIMEFRAME, limit)
+def _candle_is_closed(candle, interval):
+    """True only if this candle's time window has fully elapsed."""
+    sec = _INTERVAL_SECONDS.get(interval, 60)
+    return (candle['open_time'] + sec*1000) <= int(time.time()*1000)
+
+
+def fetch_tracking_candle(symbol, limit=6):
+    """Dedicated feed used only for TP/SL/entry monitoring -- returns only
+    FULLY CLOSED candles.
+
+    Exchange kline endpoints always append the still-forming current candle
+    as the last row. Using that unclosed candle for entry/TP/SL checks means
+    a single noisy wick mid-minute can flip WAITING_ENTRY -> OPEN, or trigger
+    an SL, before the candle actually finishes and confirms that move. That
+    is what was causing trades to show OPEN before a real entry happened, and
+    inflating SL hits on setups that were otherwise fine. We fetch a few
+    extra candles and drop any that haven't closed yet.
+    """
+    candles = fetch_klines(symbol, TRACK_TIMEFRAME, limit)
+    return [c for c in candles if _candle_is_closed(c, TRACK_TIMEFRAME)]
 
 
 def track_trades():
@@ -740,16 +822,17 @@ def track_trades():
         con=db(); rows=con.execute("SELECT * FROM trades WHERE status IN ('WAITING_ENTRY','OPEN')").fetchall(); con.close()
     for row in rows:
         try:
-            candles=fetch_klines(row['symbol'],TRACK_TIMEFRAME,3)
+            candles=fetch_tracking_candle(row['symbol'],6)
             if not candles: continue
-            u=check_trade(row,candles[-1]);
+            last_closed=candles[-1]
+            u=check_trade(row,last_closed)
             if not u: continue
             with DB_LOCK:
                 con=db();
-                sets=', '.join(f'{k}=?' for k in u); con.execute(f'UPDATE trades SET {sets},last_price=?,last_checked=? WHERE id=?',list(u.values())+[candles[-1]['close'],now_utc(),row['id']]); con.commit(); con.close()
+                sets=', '.join(f'{k}=?' for k in u); con.execute(f'UPDATE trades SET {sets},last_price=?,last_checked=? WHERE id=?',list(u.values())+[last_closed['close'],now_utc(),row['id']]); con.commit(); con.close()
             if u.get('status')=='CLOSED':
                 result=u.get('final_result','CLOSED'); icon='🟢' if result=='TP3_WIN' else '🟡' if 'TP' in result else '🔴'
-                telegram_send(f'{icon} *TRADE CLOSED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\nResult: *{result}*\nEntry: `{row["entry"]}` | SL: `{row["sl"]}`\nTP1: `{row["tp1"]}` | TP2: `{row["tp2"]}` | TP3: `{row["tp3"]}`')
+                telegram_send(f'{icon} *TRADE CLOSED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\nResult: *{result}*\nEntry: `{fmt_price(row["entry"])}` | SL: `{fmt_price(row["sl"])}`\nTP1: `{fmt_price(row["tp1"])}` | TP2: `{fmt_price(row["tp2"])}` | TP3: `{fmt_price(row["tp3"])}`')
         except Exception as e: log.warning('tracker %s: %s',row['symbol'],e)
 
 # ----------------------------- Scanning -------------------------------
@@ -845,7 +928,7 @@ def scan_once(force=False):
         # Telegram: ONLY an actually created trade. No score spam / no rejects / no waits.
         if approved:
             tid=insert_trade(trade_plan,ai)
-            telegram_send(f'🚨 *SMC AI PRO — {trade_plan["direction"]} {best_symbol}*\nTrade #{tid}\nQuant Score: `{best_score:.0f}/100`\nGemini Score: `{gemini_score:.0f}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{trade_plan["entry"]:.6f}`\nSL: `{trade_plan["sl"]:.6f}`\nTP1: `{trade_plan["tp1"]:.6f}`\nTP2: `{trade_plan["tp2"]:.6f}`\nTP3: `{trade_plan["tp3"]:.6f}`\nR:R: `1:{trade_plan["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
+            telegram_send(f'🚨 *SMC AI PRO — {trade_plan["direction"]} {best_symbol}*\nTrade #{tid}\nQuant Score: `{best_score:.0f}/100`\nGemini Score: `{gemini_score:.0f}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{fmt_price(trade_plan["entry"])}`\nSL: `{fmt_price(trade_plan["sl"])}`\nTP1: `{fmt_price(trade_plan["tp1"])}`\nTP2: `{fmt_price(trade_plan["tp2"])}`\nTP3: `{fmt_price(trade_plan["tp3"])}`\nR:R: `1:{trade_plan["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
         return result
     finally:
         LAST_SCAN=now_utc(); SCAN_LOCK.release()
