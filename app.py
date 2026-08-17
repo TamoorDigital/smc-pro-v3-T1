@@ -122,11 +122,14 @@ def build_pattern_score(patterns, direction):
         "bearish_marubozu"
     }
     # Capped low on purpose -- candle patterns are the weakest, noisiest
-    # standalone confluence in SMC/ICT community consensus; kept as a minor
-    # tiebreaker rather than a core scoring factor.
+    # standalone confluence in SMC/ICT community consensus, kept mostly as a
+    # tiebreaker. Nudged from 6 to 8 -- PROVISIONAL, based on n=2 live wins
+    # where this was the one factor present in BOTH winning trades (22% win
+    # rate with it, n=9 vs 0% without, n=2 -- direction only, not magnitude,
+    # given how thin the sample is). Revisit at 15+ trades per side.
     if direction == "LONG":
-        return min(6, 2 * len(set(patterns) & bullish)) - min(3, len(set(patterns) & bearish))
-    return min(6, 2 * len(set(patterns) & bearish)) - min(3, len(set(patterns) & bullish))
+        return min(8, 2 * len(set(patterns) & bullish)) - min(3, len(set(patterns) & bearish))
+    return min(8, 2 * len(set(patterns) & bearish)) - min(3, len(set(patterns) & bullish))
 import os, re, json, time, math, sqlite3, threading, logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -556,10 +559,15 @@ def build_analysis(symbol):
     # HTF bias 18
     if a1['bias']=='BULLISH': scores['LONG']+=18; reasons['LONG'].append('HTF bullish')
     if a1['bias']=='BEARISH': scores['SHORT']+=18; reasons['SHORT'].append('HTF bearish')
-    # Market regime 8: trend strength proxy from EMA separation / ATR.
+    # Market regime 6: trend strength proxy from EMA separation / ATR.
+    # Lowered from 8 -- PROVISIONAL, based on n=2 live wins where this factor
+    # was absent in both, vs present in most losses (0% win-rate with it,
+    # n=5; 33% without, n=6). This sample is too small to trust fully -- keep
+    # the reduction small and revisit once /api/backtest has 15+ trades per
+    # side; do not drop this further without more data.
     sep=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
     if sep >= 1.0:
-        for d in scores: scores[d]+=8 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
+        for d in scores: scores[d]+=6 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
         if a1['bias'] in ('BULLISH','BEARISH'): reasons[a1['bias'].replace('BULLISH','LONG').replace('BEARISH','SHORT')].append('trending regime')
     # Liquidity sweep 20: raised -- this is the confluence backtested SMC
     # communities cite most consistently as predictive on its own.
@@ -609,10 +617,12 @@ def build_analysis(symbol):
         if pbonus:
             scores[d]=max(0,scores[d]+pbonus)
             if pbonus>0: reasons[d].append(f'candle pattern(s): {", ".join(patterns)}')
-    # Volume 8
+    # Volume 6: lowered from 8 -- PROVISIONAL, same n=2-win caveat as trend
+    # regime above (0% win-rate with it, n=2; 22% without, n=9). Revisit at
+    # 15+ trades per side.
     if a3['volume_ratio']>=1.2:
         d='LONG' if a3['bull_mom'] else 'SHORT' if a3['bear_mom'] else None
-        if d: scores[d]+=8; reasons[d].append('volume expansion')
+        if d: scores[d]+=6; reasons[d].append('volume expansion')
     # Momentum 4
     if a3['bull_mom']: scores['LONG']+=4; reasons['LONG'].append(f'RSI {a3["rsi"]:.0f}')
     if a3['bear_mom']: scores['SHORT']+=4; reasons['SHORT'].append(f'RSI {a3["rsi"]:.0f}')
@@ -766,10 +776,10 @@ def gemini_validate(analysis):
       # Python's own read of structure -- reference only, Gemini must verify against raw candles itself.
       'python_structure_flags': analysis.get('structure_flags', {}),
       'scoring_factors_reference_max_points': {
-          'htf_bias_1h': 18, 'trend': 8, 'liquidity_sweep': 20, 'bos': 18, 'choch': 6,
-          'order_block': 8, 'fvg': 6, 'volume_expansion': 8, 'rsi_momentum': 4,
+          'htf_bias_1h': 18, 'trend': 6, 'liquidity_sweep': 20, 'bos': 18, 'choch': 6,
+          'order_block': 8, 'fvg': 6, 'volume_expansion': 6, 'rsi_momentum': 4,
           'risk_reward_ge_1_2': 5, 'crt': 4, 'tbs': 4,
-          'single_candle_pattern': 2, 'double_candle_pattern': 2, 'triple_candle_pattern': 3
+          'single_candle_pattern': 3, 'double_candle_pattern': 3, 'triple_candle_pattern': 4
       }
     }
     system="""You are an INDEPENDENT SECOND ANALYST for a crypto trading research bot -- not a rubber-stamp validator.
@@ -931,12 +941,21 @@ def track_trades():
             last_closed=candles[-1]
             u=check_trade(row,last_closed)
             if not u: continue
+            old_eff_sl = row['effective_sl'] if row['effective_sl'] is not None else row['sl']
+            new_eff_sl = u.get('effective_sl')
             with DB_LOCK:
                 con=db();
                 sets=', '.join(f'{k}=?' for k in u); con.execute(f'UPDATE trades SET {sets},last_price=?,last_checked=? WHERE id=?',list(u.values())+[last_closed['close'],now_utc(),row['id']]); con.commit(); con.close()
             if u.get('status')=='CLOSED':
                 result=u.get('final_result','CLOSED'); icon='🟢' if result=='TP3_WIN' else '🟡' if 'TP' in result else '🔴'
                 telegram_send(f'{icon} *TRADE CLOSED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\nResult: *{result}*\nEntry: `{fmt_price(row["entry"])}` | SL: `{fmt_price(row["sl"])}`\nTP1: `{fmt_price(row["tp1"])}` | TP2: `{fmt_price(row["tp2"])}` | TP3: `{fmt_price(row["tp3"])}`')
+            elif new_eff_sl is not None and new_eff_sl != old_eff_sl:
+                # Stop just ratcheted forward (TP1 -> breakeven, TP2 -> TP1) on a
+                # trade that's still running -- tell the user their risk on this
+                # trade just changed, same as a human would move a resting order.
+                htp=u.get('highest_tp', row['highest_tp'] or 0)
+                label='breakeven' if htp==1 else f'TP{htp-1}' if htp>=2 else 'moved'
+                telegram_send(f'🔒 *SL MOVED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\nTP{htp} hit -- SL moved to {label}\nOld SL: `{fmt_price(old_eff_sl)}` → New SL: `{fmt_price(new_eff_sl)}`')
         except Exception as e: log.warning('tracker %s: %s',row['symbol'],e)
 
 # ----------------------------- Scanning -------------------------------
