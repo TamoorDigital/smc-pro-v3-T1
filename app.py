@@ -128,7 +128,7 @@ def build_pattern_score(patterns, direction):
         return min(6, 2 * len(set(patterns) & bullish)) - min(3, len(set(patterns) & bearish))
     return min(6, 2 * len(set(patterns) & bearish)) - min(3, len(set(patterns) & bullish))
 import os, re, json, time, math, sqlite3, threading, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import requests
@@ -150,6 +150,7 @@ SCAN_INTERVAL = max(5, int(os.getenv('SCAN_INTERVAL_MINUTES', '15')))
 TRACK_INTERVAL = max(1, int(os.getenv('TRACK_INTERVAL_MINUTES', '1')))
 TRACK_TIMEFRAME = os.getenv('TRACK_TIMEFRAME', '1m')
 MIN_SCORE = max(0, min(100, int(os.getenv('MIN_SCORE', '70'))))
+GEMINI_MIN_SCORE = max(0, min(100, int(os.getenv('GEMINI_MIN_SCORE', '65'))))
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 # Five-project fallback. GEMINI_API_KEY remains backward compatible as project 1.
@@ -237,6 +238,10 @@ def init_db():
         # later backtest which factor combinations actually win.
         try:
             con.execute('ALTER TABLE trades ADD COLUMN factors_json TEXT')
+        except sqlite3.OperationalError:
+            pass
+        try:
+            con.execute('ALTER TABLE trades ADD COLUMN effective_sl REAL')
         except sqlite3.OperationalError:
             pass
         con.commit(); con.close()
@@ -411,10 +416,19 @@ def analyze_tf(c):
     bullish = e20 > e50 and last['close'] > e20 and slope(closes,5)>0
     bearish = e20 < e50 and last['close'] < e20 and slope(closes,5)<0
     bias='BULLISH' if bullish else 'BEARISH' if bearish else 'NEUTRAL'
-    # liquidity sweep: last candle pierced a recent swing/extreme and closed back inside.
+    # liquidity sweep: price took out a prior swing extreme within the last
+    # few candles and has since closed back on the right side of it. This is
+    # checked across a short window (not just the single latest candle) --
+    # requiring the wick AND the reclaim close in the exact same bar was
+    # missing the vast majority of real sweeps, which typically wick out on
+    # one candle and get reclaimed one or two candles later.
     prior_high=max(x['high'] for x in c[-21:-1]); prior_low=min(x['low'] for x in c[-21:-1])
-    bull_sweep = last['low'] < prior_low and last['close'] > prior_low
-    bear_sweep = last['high'] > prior_high and last['close'] < prior_high
+    swing_ref_high=max(x['high'] for x in c[-23:-3]); swing_ref_low=min(x['low'] for x in c[-23:-3])
+    recent3=c[-3:]
+    swept_low = min(x['low'] for x in recent3) < swing_ref_low
+    swept_high = max(x['high'] for x in recent3) > swing_ref_high
+    bull_sweep = swept_low and last['close'] > swing_ref_low
+    bear_sweep = swept_high and last['close'] < swing_ref_high
     # simple BOS: close breaks previous 20-candle extreme.
     bull_bos = last['close'] > prior_high
     bear_bos = last['close'] < prior_low
@@ -610,7 +624,13 @@ def build_analysis(symbol):
     else:
         sl=price+1.2*a; risk=sl-price; tp1=price-1.5*risk; tp2=price-2.3*risk; tp3=price-3.2*risk
     rr=abs(tp3-price)/max(abs(price-sl),1e-12)
-    if rr>=2: scores[direction]+=5; reasons[direction].append('R:R >= 1:2')
+    # NOTE: no R:R scoring bonus here anymore -- with the fixed 1.2/3.2 ATR
+    # SL/TP3 multipliers used below, rr is ALWAYS ~3.2 for every single
+    # candidate (confirmed: fired in 12/12 real trades), so it carried zero
+    # discriminating value while still eating 5 points of score budget on
+    # every trade. rr is still computed/shown/used for the trade plan and by
+    # Gemini's own independent R:R check on its own proposed levels -- it's
+    # just no longer counted as a quant scoring factor.
     score=min(100,scores[direction])
     # Canonical per-factor booleans for this trade, derived from the reasons
     # that actually fired for the winning direction. Stored on every trade so
@@ -630,7 +650,6 @@ def build_analysis(symbol):
         'candle_pattern': 'candle pattern' in reason_text,
         'volume_expansion': 'volume expansion' in reason_text,
         'momentum': 'RSI' in reason_text,
-        'rr_ge_2': 'R:R >= 1:2' in reason_text,
     }
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
@@ -770,6 +789,11 @@ Using ONLY the supplied raw OHLCV candles (1H/15M/5M) and structured multi-timef
 - Double Candle Pattern
 - Triple Candle Pattern
 
+Hard rules:
+1. Mark a structure element true ONLY if you can point to the specific candle(s) in raw_ohlcv_candles that show it. If you are not fully certain you can see it yourself, mark it false -- do not mark something true merely because quant_reasons or python_structure_flags mention it. Quant and Python's own detectors are known to sometimes disagree with each other; you verifying independently is the entire point of your role.
+2. Actively look for reasons to REJECT before you look for reasons to approve: check for choppy/ranging price action, conflicting timeframes, a setup that only "sort of" fits, or an entry that is chasing price rather than at a real structural level. If you find any of these, REJECT.
+3. Do not let a high quant_score talk you into a high score of your own -- score strictly from what you independently verify in the candles.
+
 python_structure_flags is Python's own detection of CHoCH/FVG/CRT/TBS/candle patterns -- treat it as a reference only, not ground truth; verify or overturn it yourself from raw_ohlcv_candles.
 
 Score it yourself (0-100) using the factor set above (max points per factor are given in scoring_factors_reference_max_points). Do not copy quant_score -- compute your own from what you actually see in the candles.
@@ -795,8 +819,8 @@ def insert_trade(a, ai):
         }
     })
     with DB_LOCK:
-        con=db(); cur=con.execute('''INSERT INTO trades(symbol,direction,entry,sl,tp1,tp2,tp3,score,ai_confidence,ai_reason,framework,created_at,factors_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-          (a['symbol'],a['direction'],a['entry'],a['sl'],a['tp1'],a['tp2'],a['tp3'],a['score'],int(ai.get('confidence',0)),ai.get('reason',''),FRAMEWORK,now_utc(),factors_json))
+        con=db(); cur=con.execute('''INSERT INTO trades(symbol,direction,entry,sl,tp1,tp2,tp3,score,ai_confidence,ai_reason,framework,created_at,factors_json,effective_sl) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+          (a['symbol'],a['direction'],a['entry'],a['sl'],a['tp1'],a['tp2'],a['tp3'],a['score'],int(ai.get('confidence',0)),ai.get('reason',''),FRAMEWORK,now_utc(),factors_json,a['sl']))
         con.commit(); tid=cur.lastrowid; con.close()
     return tid
 
@@ -805,9 +829,35 @@ def has_open_similar(symbol,direction):
         con=db(); row=con.execute("SELECT 1 FROM trades WHERE symbol=? AND direction=? AND status IN ('WAITING_ENTRY','OPEN') LIMIT 1",(symbol,direction)).fetchone(); con.close()
     return bool(row)
 
+SYMBOL_LOSS_COOLDOWN_MIN = max(0, int(os.getenv('SYMBOL_LOSS_COOLDOWN_MIN', '120')))
+
+def has_recent_loss(symbol):
+    """True if `symbol` closed a losing trade (any direction) within the
+    cooldown window. In the first 12 live trades, HYPEUSDT alone was re-entered
+    5 times within hours and lost 4 of them -- the same failing structure kept
+    getting re-scored and re-approved before the market had actually changed.
+    This is a simple, data-independent circuit breaker for that pattern."""
+    if SYMBOL_LOSS_COOLDOWN_MIN <= 0:
+        return False
+    with DB_LOCK:
+        con=db()
+        row=con.execute(
+            "SELECT close_time FROM trades WHERE symbol=? AND sl_hit=1 AND close_time IS NOT NULL "
+            "ORDER BY close_time DESC LIMIT 1", (symbol,)
+        ).fetchone()
+        con.close()
+    if not row or not row['close_time']:
+        return False
+    try:
+        last_loss=datetime.fromisoformat(row['close_time'].replace('Z','+00:00'))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - last_loss) < timedelta(minutes=SYMBOL_LOSS_COOLDOWN_MIN)
+
 def check_trade(row, candle):
-    direction=row['direction']; high=candle['high']; low=candle['low']; entry=row['entry']; sl=row['sl']
+    direction=row['direction']; high=candle['high']; low=candle['low']; entry=row['entry']
     status=row['status']; htp=row['highest_tp'] or 0
+    eff_sl = row['effective_sl'] if row['effective_sl'] is not None else row['sl']
     just_entered=False
     if status=='WAITING_ENTRY':
         if low <= entry <= high: status='OPEN'; just_entered=True
@@ -815,24 +865,36 @@ def check_trade(row, candle):
     tp_hits=[]
     for n,key in [(1,'tp1'),(2,'tp2'),(3,'tp3')]:
         if row[key] is not None and ((direction=='LONG' and high>=row[key]) or (direction=='SHORT' and low<=row[key])): tp_hits.append(n)
-    sl_hit=(low<=sl) if direction=='LONG' else (high>=sl)
+    new_htp=max([htp]+tp_hits) if tp_hits else htp
+    # Ratchet the stop forward as TPs are reached -- it only ever moves in the
+    # direction that reduces risk, never loosens. TP1 hit -> breakeven. TP2
+    # hit -> TP1. This targets a real pattern found in the live trade log:
+    # several trades ran to TP1/TP2 in our favor and then fully reversed all
+    # the way back onto the ORIGINAL stop for a full -1R loss, giving back a
+    # move that had already happened instead of locking any of it in.
+    new_eff_sl=eff_sl
+    if new_htp>=1:
+        new_eff_sl=max(new_eff_sl,entry) if direction=='LONG' else min(new_eff_sl,entry)
+    if new_htp>=2 and row['tp1'] is not None:
+        new_eff_sl=max(new_eff_sl,row['tp1']) if direction=='LONG' else min(new_eff_sl,row['tp1'])
+    sl_hit=(low<=new_eff_sl) if direction=='LONG' else (high>=new_eff_sl)
     if sl_hit and tp_hits:
-        new=max([htp]+tp_hits)
-        out={'status':'CLOSED','highest_tp':new,'tp1_hit':int(new>=1),'tp2_hit':int(new>=2),'tp3_hit':int(new>=3),'sl_hit':1,'final_result':f'TP{new}_AND_SL_SAME_CANDLE','close_time':now_utc()}
+        out={'status':'CLOSED','highest_tp':new_htp,'tp1_hit':int(new_htp>=1),'tp2_hit':int(new_htp>=2),'tp3_hit':int(new_htp>=3),
+             'sl_hit':1,'effective_sl':new_eff_sl,'final_result':f'TP{new_htp}_AND_SL_SAME_CANDLE','close_time':now_utc()}
         if just_entered: out['entry_time']=now_utc()
         return out
     if sl_hit:
-        result='SL_LOSS' if htp==0 else f'TP{htp}_HIT_THEN_SL'
-        out={'status':'CLOSED','sl_hit':1,'final_result':result,'close_time':now_utc()}
+        result='SL_LOSS' if (htp==0 and new_htp==0) else f'TP{new_htp}_LOCKED_SL'
+        out={'status':'CLOSED','sl_hit':1,'effective_sl':new_eff_sl,'final_result':result,'close_time':now_utc()}
         if just_entered: out['entry_time']=now_utc()
         return out
     if tp_hits:
-        new=max([htp]+tp_hits)
-        u={'status':'OPEN','highest_tp':new,'tp1_hit':int(new>=1),'tp2_hit':int(new>=2),'tp3_hit':int(new>=3),'last_checked':now_utc()}
+        u={'status':'OPEN','highest_tp':new_htp,'tp1_hit':int(new_htp>=1),'tp2_hit':int(new_htp>=2),'tp3_hit':int(new_htp>=3),
+           'effective_sl':new_eff_sl,'last_checked':now_utc()}
         if just_entered: u['entry_time']=now_utc()
-        if new>=3: u.update({'status':'CLOSED','final_result':'TP3_WIN','close_time':now_utc()})
+        if new_htp>=3: u.update({'status':'CLOSED','final_result':'TP3_WIN','close_time':now_utc()})
         return u
-    out={'status':status,'last_checked':now_utc()}
+    out={'status':status,'effective_sl':new_eff_sl,'last_checked':now_utc()}
     if just_entered: out['entry_time']=now_utc()
     return out
 
@@ -925,6 +987,11 @@ def scan_once(force=False):
             with DB_LOCK:
                 con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,'SKIP_OPEN_TRADE',0,reason)); con.commit(); con.close()
             result['symbols'][best_symbol].update({'decision':'SKIP_OPEN_TRADE','gemini':False,'reason':reason}); return result
+        if has_recent_loss(best_symbol):
+            reason=f'{best_symbol} hit SL within the last {SYMBOL_LOSS_COOLDOWN_MIN}min; cooling down before re-entering, Gemini skipped'
+            with DB_LOCK:
+                con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),best_symbol,best_score,'SKIP_COOLDOWN',0,reason)); con.commit(); con.close()
+            result['symbols'][best_symbol].update({'decision':'SKIP_COOLDOWN','gemini':False,'reason':reason}); return result
         # Exactly one Gemini validation chain for the winner.
         try:
             ai=gemini_validate(best)
@@ -941,7 +1008,14 @@ def scan_once(force=False):
             gemini_score=0.0
         approved=False; trade_plan=best; reason=ai.get('reason','Gemini rejected')
         if str(ai.get('decision','REJECT')).upper()=='APPROVE':
-            if gemini_score >= best_score:
+            # Two floors now, not one: gemini_score must beat quant's own read
+            # (as before) AND clear an absolute floor (GEMINI_MIN_SCORE). The
+            # relative-only check was nearly always satisfied in practice --
+            # across the first 12 live trades gemini_score was HIGHER than
+            # quant_score every single time (e.g. quant 45 -> gemini 82,
+            # quant 49 -> gemini 76), so it was gating almost nothing on its
+            # own. The absolute floor gives it real teeth.
+            if gemini_score >= best_score and gemini_score >= GEMINI_MIN_SCORE:
                 g_direction=str(ai.get('direction') or best['direction']).upper()
                 try:
                     g_entry=float(ai['entry']); g_sl=float(ai['sl'])
@@ -960,7 +1034,7 @@ def scan_once(force=False):
                     else:
                         reason=f'Gemini approved but failed hard level check: {why}'
             else:
-                reason=f'Gemini score {gemini_score:.0f} below quant score {best_score:.0f}; trade rejected'
+                reason=f'Gemini score {gemini_score:.0f} did not clear both floors (>= quant {best_score:.0f} AND >= GEMINI_MIN_SCORE {GEMINI_MIN_SCORE}); trade rejected'
         else:
             reason=ai.get('reason', f'Gemini score {gemini_score:.0f} below quant score {best_score:.0f}')
         decision='APPROVED' if approved else 'REJECTED'
@@ -1043,13 +1117,16 @@ def send_trade_summary():
 
 # ----------------------------- Backtest / factor stats -----------------
 FACTOR_KEYS = ['htf_bias','trend_regime','liquidity_sweep','bos','order_block','choch',
-               'fvg','crt','tbs','candle_pattern','volume_expansion','momentum','rr_ge_2']
+               'fvg','crt','tbs','candle_pattern','volume_expansion','momentum']
 
 def _trade_r_multiple(row):
-    """R-multiple actually achieved by a closed trade. This system does not
-    book partial profit at TP1/TP2 -- it only exits fully at TP3 or SL -- so
-    anything that ends in an SL touch (even after tagging a TP along the way)
-    realizes -1R, and only a full TP3_WIN realizes the positive reward."""
+    """R-multiple actually achieved by a closed trade.
+
+    A full SL_LOSS (never reached any TP) realizes -1R. A TPn_LOCKED_SL exit
+    (stop had already ratcheted to breakeven/TP1 before the reversal hit it,
+    see check_trade) realizes whatever that locked level actually banked --
+    0R for a breakeven stop, a positive partial R for a TP1-locked stop --
+    not a blanket -1R."""
     try:
         entry=float(row['entry']); sl=float(row['sl'])
     except (TypeError, ValueError):
@@ -1064,7 +1141,12 @@ def _trade_r_multiple(row):
             return None
         return abs(tp3-entry)/risk
     if row['sl_hit']:
-        return -1.0
+        eff=row['effective_sl'] if row['effective_sl'] is not None else sl
+        try:
+            eff=float(eff)
+        except (TypeError, ValueError):
+            eff=sl
+        return (eff-entry)/risk if row['direction']=='LONG' else (entry-eff)/risk
     return None
 
 def factor_backtest_report(min_sample=5):
