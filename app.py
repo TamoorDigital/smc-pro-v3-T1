@@ -110,6 +110,30 @@ def _final_level_check(direction, entry, sl, tp1, tp2, tp3):
     return True, "OK"
 
 
+def structure_agreement(quant_flags, ai):
+    """How much quant's own structural read and Gemini's independent read of
+    the SAME candles actually agree, checked key-by-key. Both sides are asked
+    to detect bos/choch/order_block/fvg/crt/tbs independently -- if Gemini's
+    reported structure disagrees with quant's on most of these, that's a real
+    signal neither side should be blindly trusted here, whatever the headline
+    scores say (headline scores were confirmed non-discriminating on real
+    trade outcomes: avg quant score was ~55 for both wins AND losses, avg
+    gemini score ~74 for both -- the specific factors are what carry signal,
+    not the aggregate number). Returns (agree_count, total_checked, ratio)."""
+    pairs = [('bos','bos_detected'), ('choch','choch_detected'), ('order_block','order_block_detected'),
+             ('fvg','fvg_detected'), ('crt','crt_detected'), ('tbs','tbs_detected')]
+    agree=0; total=0
+    for qk, gk in pairs:
+        gv = ai.get(gk)
+        if gv is None:
+            continue
+        total += 1
+        if bool(quant_flags.get(qk)) == bool(gv):
+            agree += 1
+    ratio = (agree/total) if total else 1.0
+    return agree, total, ratio
+
+
 def build_pattern_score(patterns, direction):
     bullish = {
         "hammer","inverted_hammer","bullish_engulfing","bullish_harami",
@@ -123,13 +147,13 @@ def build_pattern_score(patterns, direction):
     }
     # Capped low on purpose -- candle patterns are the weakest, noisiest
     # standalone confluence in SMC/ICT community consensus, kept mostly as a
-    # tiebreaker. Nudged from 6 to 8 -- PROVISIONAL, based on n=2 live wins
-    # where this was the one factor present in BOTH winning trades (22% win
-    # rate with it, n=9 vs 0% without, n=2 -- direction only, not magnitude,
-    # given how thin the sample is). Revisit at 15+ trades per side.
+    # tiebreaker. Was nudged UP to 8/-3 earlier on an n=2-win sample where it
+    # happened to be common to both winners -- a much bigger sample since
+    # (n=26-28 closed) flipped that to a small NEGATIVE edge, so reverted and
+    # cut further rather than just restored, matching the now-negative sign.
     if direction == "LONG":
-        return min(8, 2 * len(set(patterns) & bullish)) - min(3, len(set(patterns) & bearish))
-    return min(8, 2 * len(set(patterns) & bearish)) - min(3, len(set(patterns) & bullish))
+        return min(4, 2 * len(set(patterns) & bullish)) - min(2, len(set(patterns) & bearish))
+    return min(4, 2 * len(set(patterns) & bearish)) - min(2, len(set(patterns) & bullish))
 import os, re, json, time, math, sqlite3, threading, logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -264,14 +288,15 @@ def current_chat_id():
 def scanner_is_active():
     return state_get('active', '0') == '1'
 
-def telegram_send(text):
+def telegram_send(text, parse_mode='Markdown'):
     chat_id = current_chat_id()
     if not TELEGRAM_TOKEN or not chat_id:
         return False
     try:
-        r = requests.post(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage', json={
-            'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown', 'disable_web_page_preview': True
-        }, timeout=10)
+        payload = {'chat_id': chat_id, 'text': text, 'disable_web_page_preview': True}
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        r = requests.post(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage', json=payload, timeout=10)
         if not r.ok:
             log.warning('Telegram error %s: %s', r.status_code, r.text[:300])
         return r.ok
@@ -311,6 +336,101 @@ def fmt_price(v):
     if '.' in s:
         s = s.rstrip('0').rstrip('.')
     return s
+
+def fmt_price_display(v):
+    """Fixed-width, comma-grouped price for the signal card (Entry/SL/TP
+    column) -- e.g. $1,873.0500 or $0.00000288. Unlike fmt_price (which trims
+    trailing zeros to keep other messages/payloads compact), this keeps a
+    stable decimal width so the card's price column lines up cleanly."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    av = abs(v)
+    if av == 0:
+        return '$0.0000'
+    d = 4 if av >= 0.01 else max(8, -int(math.floor(math.log10(av))) + 5)
+    neg = v < 0
+    return f'{"-" if neg else ""}${abs(v):,.{d}f}'
+
+def _round_price(v):
+    """Same adaptive precision as fmt_price but returns a rounded float, for
+    payloads (e.g. to Gemini) where we want compact JSON numbers rather than
+    display strings."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return v
+    av = abs(v)
+    if av == 0:
+        return 0.0
+    if av >= 100:
+        d = 2
+    elif av >= 1:
+        d = 4
+    elif av >= 0.01:
+        d = 6
+    else:
+        d = max(8, -int(math.floor(math.log10(av))) + 5)
+    return round(v, d)
+
+def _compact_candles(candles, n=15):
+    """Token-lean candle payload for Gemini: short keys (o/h/l/c/v), adaptive
+    rounding, and no open_time (array order already conveys recency -- oldest
+    first, most recent last). Full float precision (e.g.
+    64221.499999999996) across 20 candles x 3 timeframes x 6 fields was the
+    single largest token cost per Gemini call; this cuts the candle payload
+    to roughly a third of its previous size."""
+    out=[]
+    for c in candles[-n:]:
+        out.append({
+            'o':_round_price(c.get('open')), 'h':_round_price(c.get('high')),
+            'l':_round_price(c.get('low')), 'c':_round_price(c.get('close')),
+            'v':round(float(c['volume']),2) if c.get('volume') is not None else None,
+        })
+    return out
+
+def build_signal_card(trade_plan, ai, best, best_score, gemini_score):
+    """The detailed Telegram signal card format -- plain text (no Markdown
+    bold), fixed-width prices, explicit UTC timestamp, and an Action line
+    that deterministically says 'enter now' vs 'limit order' based on how far
+    the approved entry sits from the live price, rather than trusting a
+    self-reported field."""
+    direction=trade_plan['direction']; symbol=trade_plan['symbol']
+    icon='🟢 ▲' if direction=='LONG' else '🔴 ▼'
+    current_price=best.get('price', trade_plan['entry'])
+    entry=trade_plan['entry']
+    dist=abs(entry-current_price)/current_price if current_price else 0
+    action=f'Enter now (market ~ {fmt_price_display(current_price)})' if dist<=0.0015 else f'Limit order @ {fmt_price_display(entry)}'
+    prob=int(ai.get('confidence',0) or 0)
+    rr_val=trade_plan.get('rr',0)
+    rr_str=f'1:{rr_val:.0f}' if abs(rr_val-round(rr_val))<0.05 else f'1:{rr_val:.1f}'
+    pattern=ai.get('pattern_summary') or (', '.join(ai.get('candle_patterns') or []) or 'N/A')
+    location=ai.get('location_summary') or '\u2014'
+    meaning=ai.get('meaning_summary') or '\u2014'
+    summary=ai.get('reason','')
+    ts=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    tf_str=''.join(trade_plan.get('timeframes', TIMEFRAMES))
+    bar='\u2501'*20
+    lines=[
+        f'{icon} {direction} \u2014 {symbol}', bar,
+        f'\U0001F4B0 Entry    : {fmt_price_display(entry)}',
+        f'\U0001F6D1 Stop Loss: {fmt_price_display(trade_plan["sl"])}',
+        f'\U0001F3AF TP 1     : {fmt_price_display(trade_plan["tp1"])}',
+        f'\U0001F3AF TP 2     : {fmt_price_display(trade_plan["tp2"])}',
+        f'\U0001F3AF TP 3     : {fmt_price_display(trade_plan["tp3"])}', bar,
+        f'\U0001F4CA R:R      : {rr_str}',
+        f'\U0001F3B2 Prob     : {prob}%',
+        f'Quant score : {best_score:.0f}',
+        f'gemini score: {gemini_score:.0f}', bar,
+        f'\U0001F56F\uFE0F Pattern  : {pattern}',
+        f'\U0001F4CD Location : {location}',
+        f'\U0001F4D6 Meaning  : {meaning}',
+        f'\u26A1 Action   : {action}', bar,
+        f'\U0001F4DD {summary}',
+        f'\u23F0 {ts} | {tf_str}',
+    ]
+    return '\n'.join(lines)
 
 # ----------------------------- Market Data / Exchange Fallbacks --------
 _INTERVAL_SECONDS = {
@@ -512,8 +632,18 @@ def tbs_crt_bonus(candles, direction):
 # ---------------- CHOCH + FVG detection ----------------
 def detect_choch(c, bias, window=3):
     """Change of CHaracter: price breaks the most recent opposite-side swing point
-    against the prevailing EMA bias -- an early reversal signal (distinct from BOS,
-    which is a continuation break)."""
+    while the prevailing EMA bias is not already confidently aligned with that
+    break -- an early reversal/transition signal (distinct from BOS, which is a
+    continuation break in an already-aligned trend).
+
+    Was previously gated on bias being the FULL OPPOSITE ('BEARISH' for a bull
+    CHoCH) -- but candidates only score highly for LONG once a2's bias is
+    already BULLISH from several other factors, so that condition and a bull
+    CHoCH could structurally never both be true at once. Confirmed in live
+    data: 0/17 real closed trades ever had choch=true. Loosened to "not
+    already aligned the same way" (BEARISH or NEUTRAL) so it can actually
+    fire on genuine early-transition setups instead of being permanently dead.
+    """
     out = {'bull_choch': False, 'bear_choch': False}
     highs, lows = swing_levels(c, window)
     if not highs or not lows:
@@ -521,8 +651,8 @@ def detect_choch(c, bias, window=3):
     last = c[-1]
     last_swing_high = highs[-1][1]
     last_swing_low = lows[-1][1]
-    out['bull_choch'] = bias == 'BEARISH' and last['close'] > last_swing_high
-    out['bear_choch'] = bias == 'BULLISH' and last['close'] < last_swing_low
+    out['bull_choch'] = bias != 'BULLISH' and last['close'] > last_swing_high
+    out['bear_choch'] = bias != 'BEARISH' and last['close'] < last_swing_low
     return out
 
 def detect_fvg(c, direction, lookback=15):
@@ -556,91 +686,143 @@ def build_analysis(symbol):
     # notes inline at each factor. Treat this as a documented starting point,
     # not a guarantee -- forward-test / backtest before trusting it with size.
     scores={'LONG':0,'SHORT':0}; reasons={'LONG':[],'SHORT':[]}
-    # HTF bias 18
+    # HTF bias 18 -- consistently required in practice already (fires on
+    # ~92-100% of real trades across every sample checked); kept as-is.
     if a1['bias']=='BULLISH': scores['LONG']+=18; reasons['LONG'].append('HTF bullish')
     if a1['bias']=='BEARISH': scores['SHORT']+=18; reasons['SHORT'].append('HTF bearish')
-    # Market regime 6: trend strength proxy from EMA separation / ATR.
-    # Lowered from 8 -- PROVISIONAL, based on n=2 live wins where this factor
-    # was absent in both, vs present in most losses (0% win-rate with it,
-    # n=5; 33% without, n=6). This sample is too small to trust fully -- keep
-    # the reduction small and revisit once /api/backtest has 15+ trades per
-    # side; do not drop this further without more data.
+    # Market regime (trend strength via EMA separation/ATR) 15 -- raised
+    # again. This factor's edge has now REPLICATED across three separate
+    # live samples (n=11, n=17, n=26/28) and every single time the "trend
+    # regime absent" bucket showed a 0% win rate. That's the most
+    # consistently-reproduced signal found in this system so far -- also
+    # gated as a HARD FILTER below (build_analysis returns a "no_trade"
+    # candidate if this is absent), not just a score weight.
     sep=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
-    if sep >= 1.0:
-        for d in scores: scores[d]+=6 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
+    trend_regime_ok = sep >= 1.0
+    if trend_regime_ok:
+        for d in scores: scores[d]+=15 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
         if a1['bias'] in ('BULLISH','BEARISH'): reasons[a1['bias'].replace('BULLISH','LONG').replace('BEARISH','SHORT')].append('trending regime')
-    # Liquidity sweep 20: raised -- this is the confluence backtested SMC
-    # communities cite most consistently as predictive on its own.
-    if a2['bull_sweep']: scores['LONG']+=20; reasons['LONG'].append('sell-side liquidity sweep')
-    if a2['bear_sweep']: scores['SHORT']+=20; reasons['SHORT'].append('buy-side liquidity sweep')
-    # BOS 18: raised -- our bull_bos/bear_bos are already close-confirmed
-    # (not wick-only), which is the standard SMC guides insist on for a
-    # break of structure to count at all.
-    if a2['bull_bos']: scores['LONG']+=18; reasons['LONG'].append('bullish BOS')
-    if a2['bear_bos']: scores['SHORT']+=18; reasons['SHORT'].append('bearish BOS')
-    # Order Block 8 -- lowered, and now GATED on confluence. An OB with
-    # nothing backing it is the most commonly cited false-signal source;
-    # it only scores here if the same-direction liquidity sweep already
-    # fired OR an FVG in the same direction exists nearby.
+    # Liquidity sweep 10 -- lowered from 20. Community consensus says this
+    # should be one of the strongest factors, but real data disagreed
+    # consistently: -31.8 to -38.5pt edge across three separate samples
+    # (though always on a thin n=4 "with sweep" bucket -- the sign hasn't
+    # flipped once despite the sample being small, which is worth trusting
+    # more than a single check would be). Not eliminated -- detection logic
+    # itself (break + reclaim over a 3-candle window, not a single-candle
+    # touch) looks sound on inspection, so this is a weight cut, not a
+    # rewrite of unproven "broken detection".
+    if a2['bull_sweep']: scores['LONG']+=10; reasons['LONG'].append('sell-side liquidity sweep')
+    if a2['bear_sweep']: scores['SHORT']+=10; reasons['SHORT'].append('buy-side liquidity sweep')
+    # BOS 12 -- lowered slightly. Real edge has been consistently close to
+    # neutral (+2.3 to +4.8pts across samples) despite being a close-confirmed
+    # break, not a wick-only one.
+    if a2['bull_bos']: scores['LONG']+=12; reasons['LONG'].append('bullish BOS')
+    if a2['bear_bos']: scores['SHORT']+=12; reasons['SHORT'].append('bearish BOS')
+    # Order Block 12 -- raised from 8. Real edge has been consistently
+    # positive and sizeable (+17.3 to +35.7pts across samples), still gated
+    # on confluence (same-direction sweep or FVG nearby) so a lone OB with
+    # nothing backing it still doesn't score.
     for d in ('LONG','SHORT'):
         z=detect_zone(c2,d)
         if z and z['low'] <= a3['price'] <= z['high']*1.002:
             sweep_ok = a2['bull_sweep'] if d=='LONG' else a2['bear_sweep']
             fvg_ok = detect_fvg(c2,d) is not None
             if sweep_ok or fvg_ok:
-                scores[d]+=8; reasons[d].append('price at order-block zone (confluence-backed)')
-    # CHOCH 6: lowered -- SMC guides treat CHoCH as an early reversal
-    # *warning*, not a confirmed entry trigger the way BOS is.
+                scores[d]+=12; reasons[d].append('price at order-block zone (confluence-backed)')
+    # CHOCH 5 -- kept low; SMC guides treat CHoCH as an early reversal
+    # *warning*, not a confirmed entry trigger the way BOS is. Detection was
+    # fixed (see detect_choch) to no longer be structurally impossible to
+    # fire, but real-world results after that fix aren't in yet.
     choch=detect_choch(c2, a2['bias'])
-    if choch['bull_choch']: scores['LONG']+=6; reasons['LONG'].append('bullish CHoCH')
-    if choch['bear_choch']: scores['SHORT']+=6; reasons['SHORT'].append('bearish CHoCH')
-    # FVG 6: price trading back into an unfilled fair value gap.
+    if choch['bull_choch']: scores['LONG']+=5; reasons['LONG'].append('bullish CHoCH')
+    if choch['bear_choch']: scores['SHORT']+=5; reasons['SHORT'].append('bearish CHoCH')
+    # FVG 8 -- slightly raised, edge has settled close to neutral-to-positive
+    # as sample grew (was -23.3 on a tiny sample, now roughly neutral).
     fvg_hits={}
     for d in ('LONG','SHORT'):
         fvg=detect_fvg(c2,d)
         fvg_hits[d]=fvg
         if fvg and fvg['low'] <= a3['price'] <= fvg['high']*1.002:
-            scores[d]+=6; reasons[d].append('price inside FVG')
-    # CRT + TBS confirmation (lower-timeframe sweep/reclaim), up to 8.
+            scores[d]+=8; reasons[d].append('price inside FVG')
+    # CRT + TBS confirmation (lower-timeframe sweep/reclaim), up to 8 (+4 each).
     crt_tbs_hits={}
     for d in ('LONG','SHORT'):
         bonus,breasons=tbs_crt_bonus(c3,d)
         crt_tbs_hits[d]={'bonus':bonus,'reasons':breasons}
         if bonus:
             scores[d]+=bonus; reasons[d].extend(breasons)
-    # Candle patterns (single/double/triple) on the lowest timeframe, up to 6 / -3.
-    # Lowered -- candle patterns are the weakest/noisiest confluence on their
-    # own per SMC community consensus; kept as a minor tiebreaker only.
+    # Candle patterns (single/double/triple) on the lowest timeframe, up to 4 / -2.
+    # REVERTED back down -- an earlier bump to 6/-3 was based on an n=2-win
+    # sample where candle_pattern happened to be common to both; a much
+    # bigger sample since (n=26-28) flipped this to a small NEGATIVE edge
+    # (-2.3 to -4.8pts). Exactly the overfitting risk that was flagged when
+    # that bump was made -- reverted, and cut further given the now-negative
+    # sign, not just back to the old value.
     patterns=detect_candlestick_patterns(c3)
     for d in ('LONG','SHORT'):
         pbonus=build_pattern_score(patterns,d)
         if pbonus:
             scores[d]=max(0,scores[d]+pbonus)
             if pbonus>0: reasons[d].append(f'candle pattern(s): {", ".join(patterns)}')
-    # Volume 6: lowered from 8 -- PROVISIONAL, same n=2-win caveat as trend
-    # regime above (0% win-rate with it, n=2; 22% without, n=9). Revisit at
-    # 15+ trades per side.
+    # Volume 5: this is the one factor whose negative edge REPLICATED across
+    # multiple independent samples -- unlike several others above that
+    # flipped sign as sample grew, this one has stayed consistently negative,
+    # so kept lower with more confidence than a single-sample cut would
+    # justify. Still not dropped to zero -- keep watching /api/backtest.
     if a3['volume_ratio']>=1.2:
         d='LONG' if a3['bull_mom'] else 'SHORT' if a3['bear_mom'] else None
-        if d: scores[d]+=6; reasons[d].append('volume expansion')
-    # Momentum 4
-    if a3['bull_mom']: scores['LONG']+=4; reasons['LONG'].append(f'RSI {a3["rsi"]:.0f}')
-    if a3['bear_mom']: scores['SHORT']+=4; reasons['SHORT'].append(f'RSI {a3["rsi"]:.0f}')
+        if d: scores[d]+=5; reasons[d].append('volume expansion')
+    # Momentum 3
+    if a3['bull_mom']: scores['LONG']+=3; reasons['LONG'].append(f'RSI {a3["rsi"]:.0f}')
+    if a3['bear_mom']: scores['SHORT']+=3; reasons['SHORT'].append(f'RSI {a3["rsi"]:.0f}')
     # R:R is calculated after entry/SL/TP plan.
     direction=max(scores, key=scores.get); base=scores[direction]
     price=a3['price']; a=a3['atr'] or (price*0.005)
+    # Structural SL: placed below/above the actual recent swing low/high (not
+    # just a fixed ATR multiple from the current price), with a small ATR
+    # buffer on top so normal noise doesn't tag it. A fixed "price - 1.2*ATR"
+    # ignores where the real structure actually sits -- if the swept/pullback
+    # low is much closer than 1.2 ATR, that fixed formula overshoots past
+    # perfectly good structure into wasted risk; if it's further away, the
+    # fixed formula can plant the stop LEFT INSIDE normal chop below the
+    # entry, exactly the "SL hits before the real move happens" pattern seen
+    # in the live trade log. Bounded so it's never tighter than 0.6 ATR (pure
+    # noise) nor wider than 3.0 ATR (a broken/outlier swing level) from price.
+    highs2, lows2 = swing_levels(c2, 3)
     if direction=='LONG':
-        sl=price-1.2*a; risk=price-sl; tp1=price+1.5*risk; tp2=price+2.3*risk; tp3=price+3.2*risk
+        structural=lows2[-1][1] if lows2 else price-1.2*a
+        sl=min(structural-0.25*a, price-0.6*a)
+        sl=max(sl, price-3.0*a)
+        risk=price-sl
     else:
-        sl=price+1.2*a; risk=sl-price; tp1=price-1.5*risk; tp2=price-2.3*risk; tp3=price-3.2*risk
+        structural=highs2[-1][1] if highs2 else price+1.2*a
+        sl=max(structural+0.25*a, price+0.6*a)
+        sl=min(sl, price+3.0*a)
+        risk=sl-price
+    # Auto R:R sizing: the FINAL target (TP3, the "let it run" leg) scales
+    # with how many independent confluences actually confirmed this setup --
+    # a thin setup gets a realistic, tighter target (1:2); a setup backed by
+    # many aligned confluences gets room to run further (up to 1:5). TP1/TP2
+    # stay capped at their usual near-term levels (1.5R/2.3R) either way --
+    # only the final leg moves, so the early breakeven-lock behavior (see
+    # check_trade) doesn't change for weak vs strong setups, just how far we
+    # let a genuinely strong one run before calling it done.
+    confirm_count=len(reasons[direction])
+    tp3_mult=2.0 if confirm_count<=3 else 3.2 if confirm_count<=6 else 5.0
+    tp1_mult=min(1.5,tp3_mult*0.35); tp2_mult=min(2.3,tp3_mult*0.6)
+    if direction=='LONG':
+        tp1=price+tp1_mult*risk; tp2=price+tp2_mult*risk; tp3=price+tp3_mult*risk
+    else:
+        tp1=price-tp1_mult*risk; tp2=price-tp2_mult*risk; tp3=price-tp3_mult*risk
     rr=abs(tp3-price)/max(abs(price-sl),1e-12)
-    # NOTE: no R:R scoring bonus here anymore -- with the fixed 1.2/3.2 ATR
-    # SL/TP3 multipliers used below, rr is ALWAYS ~3.2 for every single
-    # candidate (confirmed: fired in 12/12 real trades), so it carried zero
-    # discriminating value while still eating 5 points of score budget on
-    # every trade. rr is still computed/shown/used for the trade plan and by
-    # Gemini's own independent R:R check on its own proposed levels -- it's
-    # just no longer counted as a quant scoring factor.
+    reasons[direction].append(f'auto R:R target 1:{tp3_mult:.1f} ({confirm_count} confluences confirmed)')
+    # NOTE: no separate R:R scoring bonus here -- previously this always
+    # fired (fixed 3.2 multiplier meant R:R was ALWAYS >=2, confirmed in
+    # 12/12 real trades), so it carried zero discriminating value while still
+    # eating 5 points of score budget on every trade. rr is still
+    # computed/shown/used for the trade plan and by Gemini's own independent
+    # R:R check on its own proposed levels -- it's just no longer counted as
+    # a quant scoring factor, and now it's not fixed either.
     score=min(100,scores[direction])
     # Canonical per-factor booleans for this trade, derived from the reasons
     # that actually fired for the winning direction. Stored on every trade so
@@ -664,8 +846,17 @@ def build_analysis(symbol):
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
         'direction':direction,'score':score,'price':price,'entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':rr,
-        'reasons':reasons[direction], 'tf':{tf1:a1,tf2:a2,tf3:a3}, 'candles':{tf1:c1[-20:],tf2:c2[-20:],tf3:c3[-20:]},
+        'reasons':reasons[direction], 'tf':{tf1:a1,tf2:a2,tf3:a3},
+        'candles':{tf1:_compact_candles(c1),tf2:_compact_candles(c2),tf3:_compact_candles(c3)},
         'factor_flags':factor_flags,
+        # Hard-filter flags: HTF bias and trend regime are the two factors
+        # whose "absent" bucket has shown a 0% win rate consistently across
+        # every backtest sample checked (n=4-5, replicated 3+ times) --
+        # stronger and more consistent than any other single factor found.
+        # scan_once rejects a candidate outright if either is missing,
+        # before even spending a Gemini call on it.
+        'htf_bias_ok': a1['bias'] in ('BULLISH','BEARISH') and factor_flags['htf_bias'],
+        'trend_regime_ok': trend_regime_ok,
         'structure_flags':{
             'choch':choch,
             'fvg':{d:(fvg_hits[d] if fvg_hits.get(d) else None) for d in ('LONG','SHORT')},
@@ -769,17 +960,17 @@ def gemini_validate(analysis):
       'symbol':analysis['symbol'], 'framework':analysis['framework'], 'timeframes':analysis['timeframes'],
       'direction_candidate':analysis['direction'],
       'quant_score':analysis['score'],
-      'quant_entry':analysis['entry'],'quant_sl':analysis['sl'],'quant_tp1':analysis['tp1'],'quant_tp2':analysis['tp2'],'quant_tp3':analysis['tp3'],'quant_rr':analysis['rr'],
+      'quant_entry':_round_price(analysis['entry']),'quant_sl':_round_price(analysis['sl']),'quant_tp1':_round_price(analysis['tp1']),'quant_tp2':_round_price(analysis['tp2']),'quant_tp3':_round_price(analysis['tp3']),'quant_rr':round(analysis['rr'],2),
       'quant_reasons':analysis['reasons'],
-      'timeframe_analysis':{k:{x:v for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()},
+      'timeframe_analysis':{k:{x:(_round_price(v) if x in ('ema20','ema50','atr','price') else (round(v,2) if x in ('rsi','volume_ratio') else v)) for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()},
       'raw_ohlcv_candles': analysis.get('candles', {}),
       # Python's own read of structure -- reference only, Gemini must verify against raw candles itself.
       'python_structure_flags': analysis.get('structure_flags', {}),
       'scoring_factors_reference_max_points': {
-          'htf_bias_1h': 18, 'trend': 6, 'liquidity_sweep': 20, 'bos': 18, 'choch': 6,
-          'order_block': 8, 'fvg': 6, 'volume_expansion': 6, 'rsi_momentum': 4,
+          'htf_bias_1h': 18, 'trend': 15, 'liquidity_sweep': 10, 'bos': 12, 'choch': 5,
+          'order_block': 12, 'fvg': 8, 'volume_expansion': 5, 'rsi_momentum': 3,
           'risk_reward_ge_1_2': 5, 'crt': 4, 'tbs': 4,
-          'single_candle_pattern': 3, 'double_candle_pattern': 3, 'triple_candle_pattern': 4
+          'single_candle_pattern': 2, 'double_candle_pattern': 2, 'triple_candle_pattern': 2
       }
     }
     system="""You are an INDEPENDENT SECOND ANALYST for a crypto trading research bot -- not a rubber-stamp validator.
@@ -804,13 +995,20 @@ Hard rules:
 2. Actively look for reasons to REJECT before you look for reasons to approve: check for choppy/ranging price action, conflicting timeframes, a setup that only "sort of" fits, or an entry that is chasing price rather than at a real structural level. If you find any of these, REJECT.
 3. Do not let a high quant_score talk you into a high score of your own -- score strictly from what you independently verify in the candles.
 
+raw_ohlcv_candles uses short keys to save tokens: o=open, h=high, l=low, c=close, v=volume. Each timeframe's array is oldest-first, most recent candle last.
+
 python_structure_flags is Python's own detection of CHoCH/FVG/CRT/TBS/candle patterns -- treat it as a reference only, not ground truth; verify or overturn it yourself from raw_ohlcv_candles.
 
 Score it yourself (0-100) using the factor set above (max points per factor are given in scoring_factors_reference_max_points). Do not copy quant_score -- compute your own from what you actually see in the candles.
 Propose your OWN Entry, SL, TP1, TP2, TP3 for whichever direction your analysis supports (it may agree or disagree with direction_candidate), derived purely from the raw candles/structure you were given -- do not just echo the quant levels.
 Set decision to APPROVE only if your own analysis genuinely supports a valid, coherent trade with correct level ordering and R:R >= 1:2. Otherwise REJECT.
+When approving, also fill these four short fields for the trade card sent to the user -- write them yourself from what you see, do not leave them generic:
+- pattern_summary: the single clearest candle/structure pattern plus its timeframe and the price it formed at, e.g. "Three Black Crows on 15M at 1873.02"
+- location_summary: where price is sitting relative to structure right now, e.g. "at new lows, below 1H Bearish FVG 1878.91-1891.80"
+- meaning_summary: one sentence on what that implies for the trade, e.g. "Signals strong bearish continuation after breaking key support"
+- confidence: your own 0-100 probability estimate that this trade reaches TP1, based on everything above
 Return JSON only, no markdown fences:
-{"decision":"APPROVE"|"REJECT","score":0-100,"direction":"LONG"|"SHORT","confidence":0-100,"entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,"htf_bias":"BULLISH"|"BEARISH"|"NEUTRAL","bos_detected":true|false,"choch_detected":true|false,"order_block_detected":true|false,"fvg_detected":true|false,"crt_detected":true|false,"tbs_detected":true|false,"candle_patterns":["pattern_name", "..."],"reason":"short reason","risk_note":"short note"}."""
+{"decision":"APPROVE"|"REJECT","score":0-100,"direction":"LONG"|"SHORT","confidence":0-100,"entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,"htf_bias":"BULLISH"|"BEARISH"|"NEUTRAL","bos_detected":true|false,"choch_detected":true|false,"order_block_detected":true|false,"fvg_detected":true|false,"crt_detected":true|false,"tbs_detected":true|false,"candle_patterns":["pattern_name", "..."],"pattern_summary":"short string","location_summary":"short string","meaning_summary":"short string","reason":"short reason","risk_note":"short note"}."""
     return gemini_json(system, prompt)
 
 # ----------------------------- Trades ---------------------------------
@@ -872,32 +1070,43 @@ def check_trade(row, candle):
     if status=='WAITING_ENTRY':
         if low <= entry <= high: status='OPEN'; just_entered=True
         else: return None
+
+    # Conservative same-candle rule: check the stop we ALREADY had going into
+    # this candle first. OHLC alone can't tell us whether a candle that wicks
+    # through both a fresh TP level and the stop touched the TP first (good)
+    # or the stop first (bad) -- assuming the favorable order was optimistic
+    # and produced misleading "TP hit AND stop hit" closes that still counted
+    # as if the TP had safely locked in. We never give that benefit of the
+    # doubt: if the PRE-EXISTING stop is touched anywhere in this candle,
+    # that governs the exit, full stop, regardless of what else the candle's
+    # wick also touched.
+    pre_sl_hit=(low<=eff_sl) if direction=='LONG' else (high>=eff_sl)
+
     tp_hits=[]
     for n,key in [(1,'tp1'),(2,'tp2'),(3,'tp3')]:
         if row[key] is not None and ((direction=='LONG' and high>=row[key]) or (direction=='SHORT' and low<=row[key])): tp_hits.append(n)
     new_htp=max([htp]+tp_hits) if tp_hits else htp
-    # Ratchet the stop forward as TPs are reached -- it only ever moves in the
-    # direction that reduces risk, never loosens. TP1 hit -> breakeven. TP2
-    # hit -> TP1. This targets a real pattern found in the live trade log:
-    # several trades ran to TP1/TP2 in our favor and then fully reversed all
-    # the way back onto the ORIGINAL stop for a full -1R loss, giving back a
-    # move that had already happened instead of locking any of it in.
+
+    if pre_sl_hit:
+        result='SL_LOSS' if htp==0 else f'TP{htp}_LOCKED_SL'
+        out={'status':'CLOSED','sl_hit':1,'effective_sl':eff_sl,'final_result':result,'close_time':now_utc()}
+        if tp_hits:
+            # A fresh TP was also touched this candle -- record it for
+            # visibility, but the exit is governed by the stop we already
+            # had, not the new one, since we can't prove the TP came first.
+            out.update({'highest_tp':new_htp,'tp1_hit':int(new_htp>=1),'tp2_hit':int(new_htp>=2),'tp3_hit':int(new_htp>=3)})
+        if just_entered: out['entry_time']=now_utc()
+        return out
+
+    # Pre-existing stop was NOT touched -- safe to ratchet the stop forward
+    # based on whatever TPs this candle reached. TP1 hit -> breakeven. TP2
+    # hit -> TP1. Only ever moves in the direction that reduces risk.
     new_eff_sl=eff_sl
     if new_htp>=1:
         new_eff_sl=max(new_eff_sl,entry) if direction=='LONG' else min(new_eff_sl,entry)
     if new_htp>=2 and row['tp1'] is not None:
         new_eff_sl=max(new_eff_sl,row['tp1']) if direction=='LONG' else min(new_eff_sl,row['tp1'])
-    sl_hit=(low<=new_eff_sl) if direction=='LONG' else (high>=new_eff_sl)
-    if sl_hit and tp_hits:
-        out={'status':'CLOSED','highest_tp':new_htp,'tp1_hit':int(new_htp>=1),'tp2_hit':int(new_htp>=2),'tp3_hit':int(new_htp>=3),
-             'sl_hit':1,'effective_sl':new_eff_sl,'final_result':f'TP{new_htp}_AND_SL_SAME_CANDLE','close_time':now_utc()}
-        if just_entered: out['entry_time']=now_utc()
-        return out
-    if sl_hit:
-        result='SL_LOSS' if (htp==0 and new_htp==0) else f'TP{new_htp}_LOCKED_SL'
-        out={'status':'CLOSED','sl_hit':1,'effective_sl':new_eff_sl,'final_result':result,'close_time':now_utc()}
-        if just_entered: out['entry_time']=now_utc()
-        return out
+
     if tp_hits:
         u={'status':'OPEN','highest_tp':new_htp,'tp1_hit':int(new_htp>=1),'tp2_hit':int(new_htp>=2),'tp3_hit':int(new_htp>=3),
            'effective_sl':new_eff_sl,'last_checked':now_utc()}
@@ -931,11 +1140,31 @@ def fetch_tracking_candle(symbol, limit=6):
     return [c for c in candles if _candle_is_closed(c, TRACK_TIMEFRAME)]
 
 
+WAITING_ENTRY_TIMEOUT_MIN = max(0, int(os.getenv('WAITING_ENTRY_TIMEOUT_MIN', '180')))
+
 def track_trades():
     with DB_LOCK:
         con=db(); rows=con.execute("SELECT * FROM trades WHERE status IN ('WAITING_ENTRY','OPEN')").fetchall(); con.close()
     for row in rows:
         try:
+            # Trades whose limit entry never got filled: the setup that
+            # justified this level is stale by now, and the price/SL/TP the
+            # bot chose no longer reflects current structure. Auto-expire
+            # instead of leaving it parked forever (or worse, having it fill
+            # much later on totally different, unvetted market conditions).
+            if row['status']=='WAITING_ENTRY' and WAITING_ENTRY_TIMEOUT_MIN>0:
+                try:
+                    created=datetime.fromisoformat(row['created_at'].replace('Z','+00:00'))
+                except (ValueError, AttributeError):
+                    created=None
+                if created and (datetime.now(timezone.utc)-created) > timedelta(minutes=WAITING_ENTRY_TIMEOUT_MIN):
+                    with DB_LOCK:
+                        con=db(); con.execute(
+                            "UPDATE trades SET status='CLOSED', final_result='EXPIRED_NO_ENTRY', close_time=? WHERE id=?",
+                            (now_utc(), row['id'])
+                        ); con.commit(); con.close()
+                    telegram_send(f'⌛ *ENTRY EXPIRED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\nLimit entry `{fmt_price(row["entry"])}` never filled within {WAITING_ENTRY_TIMEOUT_MIN}min -- setup is stale, cancelled.')
+                    continue
             candles=fetch_tracking_candle(row['symbol'],6)
             if not candles: continue
             last_closed=candles[-1]
@@ -984,6 +1213,25 @@ def scan_once(force=False):
                 result['symbols'][symbol]={'error':str(e),'decision':'SCAN_ERROR'}
             time.sleep(1)
         if not analyses: return result
+        # HARD FILTERS: htf_bias and trend_regime are the two factors whose
+        # "absent" bucket has shown a 0% win rate consistently across every
+        # real backtest sample checked so far -- reject candidates missing
+        # either before they can even become the scan's "best" pick, rather
+        # than just weighting them. A candidate that fails this never
+        # reaches Gemini, no matter how high its raw score is otherwise.
+        passed=[a for a in analyses if a.get('htf_bias_ok') and a.get('trend_regime_ok')]
+        failed=[a for a in analyses if a not in passed]
+        analyses=passed if passed else []
+        if not analyses:
+            if failed:
+                failed.sort(key=lambda x: float(x.get('score',0)), reverse=True)
+                top=failed[0]
+                reason='No candidate passed hard filters this scan (HTF bias + trend regime both required); '
+                reason+=f'best would-be candidate {top["symbol"]} failed on: '
+                reason+=', '.join(x for x,ok in [('htf_bias',top.get('htf_bias_ok')),('trend_regime',top.get('trend_regime_ok'))] if not ok)
+                with DB_LOCK:
+                    con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),top['symbol'],top['score'],'HARD_FILTER_FAIL',0,reason)); con.commit(); con.close()
+            return result
         analyses.sort(key=lambda x: float(x.get('score',0)), reverse=True)
         best=analyses[0]; best_symbol=best['symbol']; best_score=float(best['score'])
         result['best']={'symbol':best_symbol,'score':best_score}
@@ -1035,23 +1283,38 @@ def scan_once(force=False):
             # quant 49 -> gemini 76), so it was gating almost nothing on its
             # own. The absolute floor gives it real teeth.
             if gemini_score >= best_score and gemini_score >= GEMINI_MIN_SCORE:
-                g_direction=str(ai.get('direction') or best['direction']).upper()
-                try:
-                    g_entry=float(ai['entry']); g_sl=float(ai['sl'])
-                    g_tp1=float(ai['tp1']); g_tp2=float(ai['tp2']); g_tp3=float(ai['tp3'])
-                except (KeyError, TypeError, ValueError):
-                    reason='Gemini approved but returned invalid/missing trade levels'
+                agree,total,ratio=structure_agreement(best.get('factor_flags',{}), ai)
+                # Tightened from <0.4 to <0.5 -- real trades kept showing
+                # exactly this pattern (quant bos=false/choch=false, Gemini
+                # claims bos=true/choch=true, trade then hits SL). We don't
+                # go as far as "quant automatically overrules Gemini" though:
+                # quant's own detectors are simple rule-based checks with
+                # real blind spots (see detect_choch/detect_zone), and the
+                # entire point of asking Gemini to look at the raw candles
+                # independently is that it can sometimes correctly see
+                # structure quant's fixed rules miss. Disagreement is treated
+                # as a genuine "neither read is trustworthy alone" signal,
+                # not as quant being assumed right by default.
+                if total>=3 and ratio<0.5:
+                    reason=f'Gemini score {gemini_score:.0f} cleared both floors but structure disagreement with quant too high ({agree}/{total} elements agreed, {ratio*100:.0f}%); trade held for review'
                 else:
-                    ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
-                    if ok:
-                        approved=True
-                        trade_plan=dict(best)
-                        trade_plan.update({'direction':g_direction,'entry':g_entry,'sl':g_sl,
-                                            'tp1':g_tp1,'tp2':g_tp2,'tp3':g_tp3,
-                                            'rr':abs(g_tp3-g_entry)/max(abs(g_entry-g_sl),1e-12)})
-                        reason=ai.get('reason', f'Gemini score {gemini_score:.0f} >= quant score {best_score:.0f}')
+                    g_direction=str(ai.get('direction') or best['direction']).upper()
+                    try:
+                        g_entry=float(ai['entry']); g_sl=float(ai['sl'])
+                        g_tp1=float(ai['tp1']); g_tp2=float(ai['tp2']); g_tp3=float(ai['tp3'])
+                    except (KeyError, TypeError, ValueError):
+                        reason='Gemini approved but returned invalid/missing trade levels'
                     else:
-                        reason=f'Gemini approved but failed hard level check: {why}'
+                        ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
+                        if ok:
+                            approved=True
+                            trade_plan=dict(best)
+                            trade_plan.update({'direction':g_direction,'entry':g_entry,'sl':g_sl,
+                                                'tp1':g_tp1,'tp2':g_tp2,'tp3':g_tp3,
+                                                'rr':abs(g_tp3-g_entry)/max(abs(g_entry-g_sl),1e-12)})
+                            reason=ai.get('reason', f'Gemini score {gemini_score:.0f} >= quant score {best_score:.0f}, structure agreement {ratio*100:.0f}%')
+                        else:
+                            reason=f'Gemini approved but failed hard level check: {why}'
             else:
                 reason=f'Gemini score {gemini_score:.0f} did not clear both floors (>= quant {best_score:.0f} AND >= GEMINI_MIN_SCORE {GEMINI_MIN_SCORE}); trade rejected'
         else:
@@ -1063,7 +1326,7 @@ def scan_once(force=False):
         # Telegram: ONLY an actually created trade. No score spam / no rejects / no waits.
         if approved:
             tid=insert_trade(trade_plan,ai)
-            telegram_send(f'🚨 *SMC AI PRO — {trade_plan["direction"]} {best_symbol}*\nTrade #{tid}\nQuant Score: `{best_score:.0f}/100`\nGemini Score: `{gemini_score:.0f}/100`\nAI Confidence: `{ai.get("confidence",0)}%`\nEntry: `{fmt_price(trade_plan["entry"])}`\nSL: `{fmt_price(trade_plan["sl"])}`\nTP1: `{fmt_price(trade_plan["tp1"])}`\nTP2: `{fmt_price(trade_plan["tp2"])}`\nTP3: `{fmt_price(trade_plan["tp3"])}`\nR:R: `1:{trade_plan["rr"]:.2f}`\nFramework: `{FRAMEWORK}`\nAI: *APPROVED*\nReason: {ai.get("reason","")}')
+            telegram_send(build_signal_card(trade_plan, ai, best, best_score, gemini_score), parse_mode=None)
         return result
     finally:
         LAST_SCAN=now_utc(); SCAN_LOCK.release()
@@ -1127,9 +1390,16 @@ def telegram_poll():
 
 def stats():
     with DB_LOCK:
-        con=db(); row=con.execute('''SELECT COUNT(*) total, SUM(status IN (\'WAITING_ENTRY\',\'OPEN\')) open, SUM(final_result=\'TP3_WIN\') wins, SUM(final_result=\'SL_LOSS\') losses, SUM(final_result LIKE \'TP%HIT_THEN_SL\' OR final_result LIKE \'TP%AND_SL_SAME_CANDLE\') partials FROM trades''').fetchone(); con.close()
-    total=row['total'] or 0; open_=row['open'] or 0; closed=total-open_; wins=row['wins'] or 0
-    return {'total':total,'open':open_,'closed':closed,'wins':wins,'losses':row['losses'] or 0,'partials':row['partials'] or 0,'win_rate':round(wins/closed*100,2) if closed else 0}
+        con=db(); row=con.execute('''SELECT COUNT(*) total,
+            SUM(status IN ('WAITING_ENTRY','OPEN')) open,
+            SUM(final_result='EXPIRED_NO_ENTRY') expired,
+            SUM(final_result='TP3_WIN') wins,
+            SUM(final_result='SL_LOSS') losses,
+            SUM(final_result LIKE 'TP%\\_LOCKED\\_SL' ESCAPE '\\') partials
+            FROM trades''').fetchone(); con.close()
+    total=row['total'] or 0; open_=row['open'] or 0; expired=row['expired'] or 0
+    closed=total-open_-expired; wins=row['wins'] or 0
+    return {'total':total,'open':open_,'expired':expired,'closed':closed,'wins':wins,'losses':row['losses'] or 0,'partials':row['partials'] or 0,'win_rate':round(wins/closed*100,2) if closed else 0}
 
 def send_trade_summary():
     s=stats(); telegram_send(f'📊 *TRADE STATS*\nTotal: `{s["total"]}`\nOpen: `{s["open"]}`\nWins: `{s["wins"]}`\nLosses: `{s["losses"]}`\nPartial: `{s["partials"]}`\nWin rate: `{s["win_rate"]}%`')
