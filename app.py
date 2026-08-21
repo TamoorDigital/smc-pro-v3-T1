@@ -1201,7 +1201,7 @@ def scan_once(force=False):
     global LAST_SCAN,LAST_ERROR
     if not scanner_is_active() and not force: return {'status':'stopped'}
     if not SCAN_LOCK.acquire(blocking=False): return {'status':'already_running'}
-    result={'time':now_utc(),'symbols':{},'best':None}; analyses=[]
+    result={'time':now_utc(),'symbols':{},'best':None}; analyses=[]; scan_errors=[]
     try:
         # PASS 1: every wishlist coin is scored. No Gemini and no Telegram here.
         for symbol in WATCHLIST:
@@ -1209,9 +1209,27 @@ def scan_once(force=False):
                 a=build_analysis(symbol); analyses.append(a)
                 result['symbols'][symbol]={'score':a['score'],'decision':'RANKED'}
             except Exception as e:
-                LAST_ERROR=f'{symbol}: {type(e).__name__}: {e}'; log.exception('score %s',symbol)
+                err=f'{type(e).__name__}: {e}'
+                LAST_ERROR=f'{symbol}: {err}'; log.exception('score %s',symbol)
                 result['symbols'][symbol]={'error':str(e),'decision':'SCAN_ERROR'}
+                scan_errors.append((symbol,err))
             time.sleep(1)
+        if scan_errors:
+            # Previously these were silent: dropped from `analyses`, never
+            # logged in the [SCAN] summary line, and never written to the
+            # `scans` table -- a symbol could fail every single cycle and be
+            # invisible both in the terminal log and on the dashboard. Now
+            # every failed symbol gets its own scan-log row so a persistent
+            # per-symbol or exchange-wide outage is actually visible instead
+            # of just quietly shrinking the effective watchlist.
+            log.warning('[SCAN] %d/%d symbols failed to fetch: %s', len(scan_errors), len(WATCHLIST),
+                        ', '.join(f'{s}({e.split(":")[0]})' for s,e in scan_errors))
+            with DB_LOCK:
+                con=db(); now=now_utc()
+                for s,err in scan_errors:
+                    con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
+                                (now,s,0,'SCAN_ERROR',0,err[:500]))
+                con.commit(); con.close()
         if not analyses: return result
         # HARD FILTERS: htf_bias and trend_regime are the two factors whose
         # "absent" bucket has shown a 0% win rate consistently across every
@@ -1588,7 +1606,3 @@ def setup_status():
     ai = request.args.get("ai", "").upper()
     result = classify_setup(score, {"decision": ai} if ai else None)
     return jsonify(result)
-
-
-
-
