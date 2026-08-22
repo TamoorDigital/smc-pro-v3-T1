@@ -1237,29 +1237,46 @@ def scan_once(force=False):
         # either before they can even become the scan's "best" pick, rather
         # than just weighting them. A candidate that fails this never
         # reaches Gemini, no matter how high its raw score is otherwise.
-        passed=[a for a in analyses if a.get('htf_bias_ok') and a.get('trend_regime_ok')]
-        failed=[a for a in analyses if a not in passed]
-        analyses=passed if passed else []
-        if not analyses:
-            if failed:
-                failed.sort(key=lambda x: float(x.get('score',0)), reverse=True)
-                top=failed[0]
-                reason='No candidate passed hard filters this scan (HTF bias + trend regime both required); '
-                reason+=f'best would-be candidate {top["symbol"]} failed on: '
-                reason+=', '.join(x for x,ok in [('htf_bias',top.get('htf_bias_ok')),('trend_regime',top.get('trend_regime_ok'))] if not ok)
-                with DB_LOCK:
-                    con=db(); con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now_utc(),top['symbol'],top['score'],'HARD_FILTER_FAIL',0,reason)); con.commit(); con.close()
-            return result
+        #
+        # IMPORTANT: `analyses` is kept as the FULL list for dashboard/log
+        # visibility -- only `candidates` (the hard-filter survivors) is used
+        # to pick "best". A previous version reassigned `analyses` itself to
+        # the filtered list, which meant any symbol failing the hard filter
+        # got NO scan-log row at all once at least one other symbol passed --
+        # 14 of 15 successfully-scored symbols could vanish from the
+        # dashboard even though every fetch succeeded. Every symbol that was
+        # actually scored now always gets its own row.
+        candidates=[a for a in analyses if a.get('htf_bias_ok') and a.get('trend_regime_ok')]
         analyses.sort(key=lambda x: float(x.get('score',0)), reverse=True)
-        best=analyses[0]; best_symbol=best['symbol']; best_score=float(best['score'])
+        if not candidates:
+            top=analyses[0]
+            with DB_LOCK:
+                con=db(); now=now_utc()
+                for a in analyses:
+                    ok_htf=a.get('htf_bias_ok'); ok_trend=a.get('trend_regime_ok')
+                    missing=', '.join(x for x,ok in [('htf_bias',ok_htf),('trend_regime',ok_trend)] if not ok)
+                    con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
+                                (now,a['symbol'],a['score'],'HARD_FILTER_FAIL',0,f'Failed hard filter: {missing}'))
+                con.commit(); con.close()
+            log.info('[SCAN] scores=%s | no candidate passed hard filters (best would-be: %s score=%.1f)',
+                      ', '.join(f"{a['symbol']}:{a['score']}" for a in analyses), top['symbol'], float(top['score']))
+            return result
+        candidates.sort(key=lambda x: float(x.get('score',0)), reverse=True)
+        best=candidates[0]; best_symbol=best['symbol']; best_score=float(best['score'])
         result['best']={'symbol':best_symbol,'score':best_score}
         log.info('[SCAN] scores=%s | BEST=%s score=%.1f', ', '.join(f"{a['symbol']}:{a['score']}" for a in analyses), best_symbol,best_score)
         # Dashboard scan log: every candidate, but never Telegram.
         with DB_LOCK:
             con=db(); now=now_utc()
             for a in analyses:
-                d='RANKED_WAIT' if a['symbol']!=best_symbol else 'BEST_PENDING'
-                con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now,a['symbol'],a['score'],d,0,'Not highest score in this scan' if d=='RANKED_WAIT' else 'Highest score; MIN_SCORE pending'))
+                if a.get('htf_bias_ok') and a.get('trend_regime_ok'):
+                    d='RANKED_WAIT' if a['symbol']!=best_symbol else 'BEST_PENDING'
+                    reason='Not highest score in this scan' if d=='RANKED_WAIT' else 'Highest score; MIN_SCORE pending'
+                else:
+                    d='HARD_FILTER_FAIL'
+                    missing=', '.join(x for x,ok in [('htf_bias',a.get('htf_bias_ok')),('trend_regime',a.get('trend_regime_ok'))] if not ok)
+                    reason=f'Failed hard filter: {missing}'
+                con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now,a['symbol'],a['score'],d,0,reason))
             con.commit(); con.close()
         # Only highest score reaches MIN_SCORE.
         if best_score < MIN_SCORE:
@@ -1606,3 +1623,7 @@ def setup_status():
     ai = request.args.get("ai", "").upper()
     result = classify_setup(score, {"decision": ai} if ai else None)
     return jsonify(result)
+
+
+
+
