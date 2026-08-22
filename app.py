@@ -531,7 +531,7 @@ def swing_levels(c, window=3):
 
 def analyze_tf(c):
     closes=[x['close'] for x in c]; vols=[x['volume'] for x in c]
-    e20=ema(closes,20); e50=ema(closes,50); r=rsi(closes); a=atr(c)
+    e20=ema(closes,20); e50=ema(closes,50); e200=ema(closes,200) if len(closes)>=50 else None; r=rsi(closes); a=atr(c)
     highs,lows=swing_levels(c,3)
     last=c[-1]; prev=c[-2]
     recent_high=max(x['high'] for x in c[-30:]); recent_low=min(x['low'] for x in c[-30:])
@@ -559,7 +559,7 @@ def analyze_tf(c):
     bull_mom = r >= 52 and r <= 72
     bear_mom = r <= 48 and r >= 28
     return {
-        'bias':bias, 'ema20':e20, 'ema50':e50, 'rsi':r, 'atr':a,
+        'bias':bias, 'ema20':e20, 'ema50':e50, 'ema200':e200, 'rsi':r, 'atr':a,
         'volume_ratio':vol_ratio, 'bull_sweep':bull_sweep, 'bear_sweep':bear_sweep,
         'bull_bos':bull_bos, 'bear_bos':bear_bos,
         'bull_mom':bull_mom, 'bear_mom':bear_mom,
@@ -671,7 +671,7 @@ def detect_fvg(c, direction, lookback=15):
 
 def build_analysis(symbol):
     tf1,tf2,tf3=TIMEFRAMES
-    c1=fetch_klines(symbol,tf1,160); c2=fetch_klines(symbol,tf2,160); c3=fetch_klines(symbol,tf3,160)
+    c1=fetch_klines(symbol,tf1,220); c2=fetch_klines(symbol,tf2,160); c3=fetch_klines(symbol,tf3,160)
     a1,a2,a3=analyze_tf(c1),analyze_tf(c2),analyze_tf(c3)
     # Score both directions. Require MTF alignment, but allow one lower TF disagreement if setup is strong.
     #
@@ -690,6 +690,15 @@ def build_analysis(symbol):
     # ~92-100% of real trades across every sample checked); kept as-is.
     if a1['bias']=='BULLISH': scores['LONG']+=18; reasons['LONG'].append('HTF bullish')
     if a1['bias']=='BEARISH': scores['SHORT']+=18; reasons['SHORT'].append('HTF bearish')
+    # 1H 200 EMA position 4 -- part of the user's stated 3-stage methodology
+    # ("price 200 EMA ke upar ya neeche") which this system didn't check at
+    # all before (only had EMA20/EMA50). Small bonus, not a hard gate --
+    # EMA200 on a 220-candle 1H fetch is still a bit short of fully settled,
+    # so this is treated as a confirming nudge, not a strong standalone
+    # factor, until there's backtest data on it specifically.
+    if a1.get('ema200') is not None:
+        if a1['price']>a1['ema200']: scores['LONG']+=4; reasons['LONG'].append('1H above 200EMA')
+        if a1['price']<a1['ema200']: scores['SHORT']+=4; reasons['SHORT'].append('1H below 200EMA')
     # Market regime (trend strength via EMA separation/ATR) 15 -- raised
     # again. This factor's edge has now REPLICATED across three separate
     # live samples (n=11, n=17, n=26/28) and every single time the "trend
@@ -702,40 +711,51 @@ def build_analysis(symbol):
     if trend_regime_ok:
         for d in scores: scores[d]+=15 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
         if a1['bias'] in ('BULLISH','BEARISH'): reasons[a1['bias'].replace('BULLISH','LONG').replace('BEARISH','SHORT')].append('trending regime')
-    # Liquidity sweep 10 -- lowered from 20. Community consensus says this
-    # should be one of the strongest factors, but real data disagreed
-    # consistently: -31.8 to -38.5pt edge across three separate samples
-    # (though always on a thin n=4 "with sweep" bucket -- the sign hasn't
-    # flipped once despite the sample being small, which is worth trusting
-    # more than a single check would be). Not eliminated -- detection logic
-    # itself (break + reclaim over a 3-candle window, not a single-candle
-    # touch) looks sound on inspection, so this is a weight cut, not a
-    # rewrite of unproven "broken detection".
-    if a2['bull_sweep']: scores['LONG']+=10; reasons['LONG'].append('sell-side liquidity sweep')
-    if a2['bear_sweep']: scores['SHORT']+=10; reasons['SHORT'].append('buy-side liquidity sweep')
-    # BOS 12 -- lowered slightly. Real edge has been consistently close to
-    # neutral (+2.3 to +4.8pts across samples) despite being a close-confirmed
-    # break, not a wick-only one.
-    if a2['bull_bos']: scores['LONG']+=12; reasons['LONG'].append('bullish BOS')
-    if a2['bear_bos']: scores['SHORT']+=12; reasons['SHORT'].append('bearish BOS')
+    # Liquidity sweep 10 -- MOVED from 15M (a2) to 5M (a3). This is the
+    # user's stated methodology: 1H decides bias, 15M identifies the
+    # zone (OB/FVG -- kept on a2 below), and 5M is where the actual sweep +
+    # structure-shift ENTRY TRIGGER happens. Checking sweep/BOS/CHoCH on 15M
+    # blurred "zone" and "trigger" into the same timeframe; this separates
+    # them properly. Weight itself unchanged (still lowered from the
+    # original 20 -- see below).
+    #
+    # Weight lowered from 20. Community consensus says this should be one of
+    # the strongest factors, but real data on the OLD (15M) wiring
+    # disagreed consistently: -31.8 to -38.5pt edge across three separate
+    # samples (though always on a thin n=4 "with sweep" bucket). Moving the
+    # check to 5M is a fresh start for this factor -- watch /api/backtest
+    # again once enough trades accumulate under the new wiring before
+    # re-adjusting the weight either way.
+    if a3['bull_sweep']: scores['LONG']+=10; reasons['LONG'].append('5M sell-side liquidity sweep')
+    if a3['bear_sweep']: scores['SHORT']+=10; reasons['SHORT'].append('5M buy-side liquidity sweep')
+    # BOS 12 -- MOVED from 15M to 5M for the same reason as sweep above (this
+    # is the "MSS" / entry-trigger structure break in the user's 3-stage
+    # model, not the zone-finding timeframe). Weight kept the same for now;
+    # prior edge data was measured on the old 15M wiring and needs re-
+    # checking against fresh trades under the new one.
+    if a3['bull_bos']: scores['LONG']+=12; reasons['LONG'].append('5M bullish BOS')
+    if a3['bear_bos']: scores['SHORT']+=12; reasons['SHORT'].append('5M bearish BOS')
     # Order Block 12 -- raised from 8. Real edge has been consistently
     # positive and sizeable (+17.3 to +35.7pts across samples), still gated
     # on confluence (same-direction sweep or FVG nearby) so a lone OB with
-    # nothing backing it still doesn't score.
+    # nothing backing it still doesn't score. The OB/FVG *zone* itself stays
+    # identified on 15M (c2) -- only the confluence check now looks at the
+    # 5M sweep, matching "zone on 15M, trigger on 5M".
     for d in ('LONG','SHORT'):
         z=detect_zone(c2,d)
         if z and z['low'] <= a3['price'] <= z['high']*1.002:
-            sweep_ok = a2['bull_sweep'] if d=='LONG' else a2['bear_sweep']
+            sweep_ok = a3['bull_sweep'] if d=='LONG' else a3['bear_sweep']
             fvg_ok = detect_fvg(c2,d) is not None
             if sweep_ok or fvg_ok:
                 scores[d]+=12; reasons[d].append('price at order-block zone (confluence-backed)')
-    # CHOCH 5 -- kept low; SMC guides treat CHoCH as an early reversal
-    # *warning*, not a confirmed entry trigger the way BOS is. Detection was
-    # fixed (see detect_choch) to no longer be structurally impossible to
-    # fire, but real-world results after that fix aren't in yet.
-    choch=detect_choch(c2, a2['bias'])
-    if choch['bull_choch']: scores['LONG']+=5; reasons['LONG'].append('bullish CHoCH')
-    if choch['bear_choch']: scores['SHORT']+=5; reasons['SHORT'].append('bearish CHoCH')
+    # CHOCH 5 -- MOVED from 15M to 5M, same reasoning as sweep/BOS above:
+    # this is the entry-trigger timeframe's structure-shift signal, not the
+    # zone-identification timeframe's. Kept low; SMC guides treat CHoCH as
+    # an early reversal *warning*, not a confirmed entry trigger the way BOS
+    # is.
+    choch=detect_choch(c3, a3['bias'])
+    if choch['bull_choch']: scores['LONG']+=5; reasons['LONG'].append('5M bullish CHoCH')
+    if choch['bear_choch']: scores['SHORT']+=5; reasons['SHORT'].append('5M bearish CHoCH')
     # FVG 8 -- slightly raised, edge has settled close to neutral-to-positive
     # as sample grew (was -23.3 on a tiny sample, now roughly neutral).
     fvg_hits={}
@@ -812,8 +832,22 @@ def build_analysis(symbol):
     tp1_mult=min(1.5,tp3_mult*0.35); tp2_mult=min(2.3,tp3_mult*0.6)
     if direction=='LONG':
         tp1=price+tp1_mult*risk; tp2=price+tp2_mult*risk; tp3=price+tp3_mult*risk
+        # Anchor TP3 to a real structural level (the recent 1H swing
+        # high -- our best proxy for "previous high / liquidity pool")
+        # when that level is more conservative than the pure ATR-multiple
+        # guess. An ATR-based target is just a distance -- it doesn't know
+        # whether real resistance/liquidity actually sits closer than that.
+        # Only caps it (never extends beyond the ATR target), and only if
+        # the structural level still leaves room beyond TP2 to be a
+        # meaningful third target.
+        structural_cap=a1.get('high')
+        if structural_cap and structural_cap>tp2*1.002:
+            tp3=min(tp3, structural_cap)
     else:
         tp1=price-tp1_mult*risk; tp2=price-tp2_mult*risk; tp3=price-tp3_mult*risk
+        structural_cap=a1.get('low')
+        if structural_cap and structural_cap<tp2*0.998:
+            tp3=max(tp3, structural_cap)
     rr=abs(tp3-price)/max(abs(price-sl),1e-12)
     reasons[direction].append(f'auto R:R target 1:{tp3_mult:.1f} ({confirm_count} confluences confirmed)')
     # NOTE: no separate R:R scoring bonus here -- previously this always
@@ -843,6 +877,19 @@ def build_analysis(symbol):
         'volume_expansion': 'volume expansion' in reason_text,
         'momentum': 'RSI' in reason_text,
     }
+    # 200 EMA alignment on the 1H timeframe -- a slower, less noisy trend
+    # filter than the EMA20/50 crossover that currently drives `bias` itself.
+    # Added to the HARD FILTER (not just the existing small +4 score bonus)
+    # on the reasoning that EMA20/50 crosses far more often in choppy
+    # conditions than price actually holding one side of its 200 EMA -- this
+    # is exactly the kind of extra confirmation meant to cut down on the
+    # choppy/ranging false "trending" calls that have been driving losses.
+    # Falls back to "aligned" (doesn't block) when there isn't enough history
+    # to compute a real 200 EMA yet, rather than permanently excluding new
+    # listings.
+    ema200_aligned = True
+    if a1.get('ema200') is not None:
+        ema200_aligned = (a1['bias']=='BULLISH' and a1['price']>a1['ema200']) or (a1['bias']=='BEARISH' and a1['price']<a1['ema200'])
     return {
         'symbol':symbol,'framework':FRAMEWORK,'timeframes':TIMEFRAMES,
         'direction':direction,'score':score,'price':price,'entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':rr,
@@ -855,7 +902,7 @@ def build_analysis(symbol):
         # stronger and more consistent than any other single factor found.
         # scan_once rejects a candidate outright if either is missing,
         # before even spending a Gemini call on it.
-        'htf_bias_ok': a1['bias'] in ('BULLISH','BEARISH') and factor_flags['htf_bias'],
+        'htf_bias_ok': a1['bias'] in ('BULLISH','BEARISH') and factor_flags['htf_bias'] and ema200_aligned,
         'trend_regime_ok': trend_regime_ok,
         'structure_flags':{
             'choch':choch,
@@ -962,7 +1009,7 @@ def gemini_validate(analysis):
       'quant_score':analysis['score'],
       'quant_entry':_round_price(analysis['entry']),'quant_sl':_round_price(analysis['sl']),'quant_tp1':_round_price(analysis['tp1']),'quant_tp2':_round_price(analysis['tp2']),'quant_tp3':_round_price(analysis['tp3']),'quant_rr':round(analysis['rr'],2),
       'quant_reasons':analysis['reasons'],
-      'timeframe_analysis':{k:{x:(_round_price(v) if x in ('ema20','ema50','atr','price') else (round(v,2) if x in ('rsi','volume_ratio') else v)) for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()},
+      'timeframe_analysis':{k:{x:(_round_price(v) if x in ('ema20','ema50','ema200','atr','price') else (round(v,2) if x in ('rsi','volume_ratio') else v)) for x,v in a.items() if x not in ('high','low','range')} for k,a in analysis['tf'].items()},
       'raw_ohlcv_candles': analysis.get('candles', {}),
       # Python's own read of structure -- reference only, Gemini must verify against raw candles itself.
       'python_structure_flags': analysis.get('structure_flags', {}),
