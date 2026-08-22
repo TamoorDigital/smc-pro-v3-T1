@@ -258,6 +258,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS bot_state (
             key TEXT PRIMARY KEY, value TEXT
         );
+        CREATE TABLE IF NOT EXISTS watch_state (
+            symbol TEXT PRIMARY KEY,
+            state TEXT NOT NULL DEFAULT 'IDLE',
+            direction TEXT,
+            bias_set_at TEXT,
+            zone_reached_at TEXT,
+            last_updated TEXT
+        );
         ''')
         # Migration: older DBs won't have this column yet. SQLite has no
         # "ADD COLUMN IF NOT EXISTS", so try and swallow the duplicate-column
@@ -529,6 +537,27 @@ def swing_levels(c, window=3):
         if l == min(x['low'] for x in c[i-window:i+window+1]): lows.append((i,l))
     return highs, lows
 
+def detect_equal_levels(swings, tolerance_pct=0.0015):
+    """Equal Highs / Equal Lows: a genuine SMC liquidity-pool concept not
+    previously implemented. Real resting stops/liquidity cluster where
+    several swing points sit at nearly the same price -- a far stronger,
+    more reliable sweep target/magnet than one arbitrary single swing point.
+    Looks at the most recent handful of swings and returns the tightest
+    cluster of 2+ points within tolerance_pct of each other, or None."""
+    if len(swings) < 2:
+        return None
+    prices=[p for _,p in swings[-6:]]
+    best=None
+    for i in range(len(prices)):
+        cluster=[prices[i]]
+        for j in range(len(prices)):
+            if i==j: continue
+            if abs(prices[j]-prices[i])/prices[i] <= tolerance_pct:
+                cluster.append(prices[j])
+        if len(cluster)>=2 and (best is None or len(cluster)>best['count']):
+            best={'level':sum(cluster)/len(cluster),'count':len(cluster)}
+    return best
+
 def analyze_tf(c):
     closes=[x['close'] for x in c]; vols=[x['volume'] for x in c]
     e20=ema(closes,20); e50=ema(closes,50); e200=ema(closes,200) if len(closes)>=50 else None; r=rsi(closes); a=atr(c)
@@ -552,9 +581,14 @@ def analyze_tf(c):
     swept_high = max(x['high'] for x in recent3) > swing_ref_high
     bull_sweep = swept_low and last['close'] > swing_ref_low
     bear_sweep = swept_high and last['close'] < swing_ref_high
-    # simple BOS: close breaks previous 20-candle extreme.
-    bull_bos = last['close'] > prior_high
-    bear_bos = last['close'] < prior_low
+    # simple BOS: close breaks previous 20-candle extreme -- checked over the
+    # last 2 candles, not just the literal most-recent one. A break that
+    # happened one candle ago is still fresh/tradeable; requiring it to be
+    # the EXACT last candle was a common source of quant missing a BOS that
+    # Gemini (looking at the whole recent picture, not one bar) correctly saw.
+    recent2=c[-2:]
+    bull_bos = any(x['close'] > prior_high for x in recent2)
+    bear_bos = any(x['close'] < prior_low for x in recent2)
     # momentum confirmation
     bull_mom = r >= 52 and r <= 72
     bear_mom = r <= 48 and r >= 28
@@ -808,17 +842,43 @@ def build_analysis(symbol):
     # entry, exactly the "SL hits before the real move happens" pattern seen
     # in the live trade log. Bounded so it's never tighter than 0.6 ATR (pure
     # noise) nor wider than 3.0 ATR (a broken/outlier swing level) from price.
+    highs1, lows1 = swing_levels(c1, 3)
     highs2, lows2 = swing_levels(c2, 3)
+    eqh1=detect_equal_levels(highs1); eql1=detect_equal_levels(lows1)
+    eqh2=detect_equal_levels(highs2); eql2=detect_equal_levels(lows2)
     if direction=='LONG':
         structural=lows2[-1][1] if lows2 else price-1.2*a
-        sl=min(structural-0.25*a, price-0.6*a)
-        sl=max(sl, price-3.0*a)
+        # If the structural low IS an Equal-Lows liquidity pool (2+ swing
+        # lows clustered together), give it MORE room, not less -- this is
+        # exactly the pattern confirmed visually live (LINKUSDT, HYPEUSDT):
+        # price wicks through a well-defined pool to hunt stops, THEN
+        # reverses hard the intended direction. A pool draws a sharper,
+        # further-overshooting wick than a random single swing low does.
+        eql=eql2 or eql1
+        pool_hit=eql and abs(eql['level']-structural)/price<=0.01
+        buf=0.5*a if pool_hit else 0.25*a
+        sl=min(structural-buf, price-0.6*a)
+        sl=max(sl, price-(3.5*a if pool_hit else 3.0*a))
         risk=price-sl
+        if pool_hit: reasons[direction].append(f'SL widened -- sits at an equal-lows liquidity pool ({eql["count"]}x)')
     else:
         structural=highs2[-1][1] if highs2 else price+1.2*a
-        sl=max(structural+0.25*a, price+0.6*a)
-        sl=min(sl, price+3.0*a)
+        eqh=eqh2 or eqh1
+        pool_hit=eqh and abs(eqh['level']-structural)/price<=0.01
+        buf=0.5*a if pool_hit else 0.25*a
+        sl=max(structural+buf, price+0.6*a)
+        sl=min(sl, price+(3.5*a if pool_hit else 3.0*a))
         risk=sl-price
+        if pool_hit: reasons[direction].append(f'SL widened -- sits at an equal-highs liquidity pool ({eqh["count"]}x)')
+    # Equal Highs/Lows confluence 6 -- only credited when our OWN sweep flag
+    # also fired in the same direction, so this is confirmation that the
+    # swept level was a real multi-touch liquidity pool (stronger, more
+    # reliable) rather than one arbitrary single swing point, not a
+    # standalone signal on its own.
+    if eql1 and a2['bull_sweep']:
+        scores['LONG']+=6; reasons['LONG'].append(f"swept equal-lows pool ({eql1['count']}x @ {fmt_price(eql1['level'])})")
+    if eqh1 and a2['bear_sweep']:
+        scores['SHORT']+=6; reasons['SHORT'].append(f"swept equal-highs pool ({eqh1['count']}x @ {fmt_price(eqh1['level'])})")
     # Auto R:R sizing: the FINAL target (TP3, the "let it run" leg) scales
     # with how many independent confluences actually confirmed this setup --
     # a thin setup gets a realistic, tighter target (1:2); a setup backed by
@@ -832,20 +892,19 @@ def build_analysis(symbol):
     tp1_mult=min(1.5,tp3_mult*0.35); tp2_mult=min(2.3,tp3_mult*0.6)
     if direction=='LONG':
         tp1=price+tp1_mult*risk; tp2=price+tp2_mult*risk; tp3=price+tp3_mult*risk
-        # Anchor TP3 to a real structural level (the recent 1H swing
-        # high -- our best proxy for "previous high / liquidity pool")
-        # when that level is more conservative than the pure ATR-multiple
-        # guess. An ATR-based target is just a distance -- it doesn't know
-        # whether real resistance/liquidity actually sits closer than that.
-        # Only caps it (never extends beyond the ATR target), and only if
-        # the structural level still leaves room beyond TP2 to be a
-        # meaningful third target.
-        structural_cap=a1.get('high')
+        # Anchor TP3 to a real structural level -- prefer an Equal-Highs
+        # liquidity pool above price (a genuine "draw on liquidity" magnet,
+        # the concept behind "TP = previous high / liquidity pool"), falling
+        # back to the plain recent 1H swing high if no pool is detected.
+        # Only caps the ATR-based guess (never extends beyond it), and only
+        # if the level still leaves room beyond TP2 to be a meaningful
+        # third target.
+        structural_cap=eqh1['level'] if (eqh1 and eqh1['level']>price) else a1.get('high')
         if structural_cap and structural_cap>tp2*1.002:
             tp3=min(tp3, structural_cap)
     else:
         tp1=price-tp1_mult*risk; tp2=price-tp2_mult*risk; tp3=price-tp3_mult*risk
-        structural_cap=a1.get('low')
+        structural_cap=eql1['level'] if (eql1 and eql1['level']<price) else a1.get('low')
         if structural_cap and structural_cap<tp2*0.998:
             tp3=max(tp3, structural_cap)
     rr=abs(tp3-price)/max(abs(price-sl),1e-12)
@@ -876,6 +935,7 @@ def build_analysis(symbol):
         'candle_pattern': 'candle pattern' in reason_text,
         'volume_expansion': 'volume expansion' in reason_text,
         'momentum': 'RSI' in reason_text,
+        'eqh_eql_pool': 'liquidity pool' in reason_text and 'swept' in reason_text,
     }
     # 200 EMA alignment on the 1H timeframe -- a slower, less noisy trend
     # filter than the EMA20/50 crossover that currently drives `bias` itself.
@@ -909,6 +969,8 @@ def build_analysis(symbol):
             'fvg':{d:(fvg_hits[d] if fvg_hits.get(d) else None) for d in ('LONG','SHORT')},
             'crt_tbs':crt_tbs_hits,
             'candlestick_patterns':patterns,
+            'equal_highs':{'level':_round_price(eqh1['level']),'count':eqh1['count']} if eqh1 else None,
+            'equal_lows':{'level':_round_price(eql1['level']),'count':eql1['count']} if eql1 else None,
         }
     }
 
@@ -1189,6 +1251,97 @@ def fetch_tracking_candle(symbol, limit=6):
 
 WAITING_ENTRY_TIMEOUT_MIN = max(0, int(os.getenv('WAITING_ENTRY_TIMEOUT_MIN', '180')))
 
+# ----------------------------- Watch-state machine ----------------------
+# Persists a per-symbol, multi-cycle "waiting for the setup to actually
+# develop" workflow across scan_once() calls, instead of judging every
+# candidate from a single-snapshot view each cycle:
+#   IDLE          -- nothing being tracked, or the last watch was invalidated
+#   BIAS_SET      -- 1H bias + hard filters (HTF bias, 200 EMA, trend regime)
+#                    passed at least once; waiting for price to pull back
+#                    into a 15M order-block/FVG zone
+#   ZONE_REACHED  -- price has entered that zone; waiting for a genuine 5M
+#                    trigger (sweep, BOS, or CHoCH) before treating it as a
+#                    real, confirmed setup
+# Only a transition into a fresh trigger while in ZONE_REACHED is allowed to
+# proceed to full scoring/Gemini/trade creation this cycle -- everything
+# else just updates state and is skipped, which also cuts down on repeatedly
+# calling Gemini on the same still-forming setup every single cycle.
+WATCH_STATE_ENABLED = os.getenv('WATCH_STATE_ENABLED', '1').strip().lower() in ('1','true','yes','on')
+WATCH_BIAS_TIMEOUT_MIN = max(0, int(os.getenv('WATCH_BIAS_TIMEOUT_MIN', '480')))   # bias goes stale after 8h without reaching a zone
+WATCH_ZONE_TIMEOUT_MIN = max(0, int(os.getenv('WATCH_ZONE_TIMEOUT_MIN', '150')))   # setup abandoned after 2.5h in-zone without a trigger
+
+def _get_watch_state(symbol):
+    with DB_LOCK:
+        con=db(); row=con.execute('SELECT * FROM watch_state WHERE symbol=?',(symbol,)).fetchone(); con.close()
+    return dict(row) if row else None
+
+def _set_watch_state(symbol, state, direction, bias_set_at, zone_reached_at):
+    with DB_LOCK:
+        con=db()
+        con.execute('''INSERT INTO watch_state(symbol,state,direction,bias_set_at,zone_reached_at,last_updated)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(symbol) DO UPDATE SET state=excluded.state,direction=excluded.direction,
+                       bias_set_at=excluded.bias_set_at,zone_reached_at=excluded.zone_reached_at,last_updated=excluded.last_updated''',
+                    (symbol,state,direction,bias_set_at,zone_reached_at,now_utc()))
+        con.commit(); con.close()
+
+def _minutes_since(ts):
+    if not ts: return None
+    try:
+        t=datetime.fromisoformat(ts.replace('Z','+00:00'))
+    except (ValueError, AttributeError):
+        return None
+    return (datetime.now(timezone.utc)-t).total_seconds()/60.0
+
+def update_watch_state(a):
+    """Advances (or resets) `a['symbol']`'s watch state given this cycle's
+    fresh analysis. Returns (status, note):
+      status='TRIGGERED' -> a genuine, freshly-confirmed setup; caller should
+                             treat this candidate as eligible this cycle.
+      status='IDLE'/'BIAS_SET'/'ZONE_REACHED' -> not eligible yet; note
+                             explains what it's waiting for (dashboard-visible).
+    """
+    symbol=a['symbol']; direction=a['direction']
+    hard_ok = bool(a.get('htf_bias_ok')) and bool(a.get('trend_regime_ok'))
+    ff = a.get('factor_flags', {})
+    in_zone_now = bool(ff.get('order_block')) or bool(ff.get('fvg'))
+    trigger_now = bool(ff.get('liquidity_sweep')) or bool(ff.get('bos')) or bool(ff.get('choch')) or bool(ff.get('eqh_eql_pool'))
+    row=_get_watch_state(symbol)
+
+    if not hard_ok:
+        if row and row['state']!='IDLE':
+            _set_watch_state(symbol,'IDLE',None,None,None)
+        return 'IDLE','HTF bias/trend regime not currently valid'
+
+    if row is None or row['state']=='IDLE' or row['direction']!=direction:
+        # fresh bias (or direction flipped) -- start watching, don't act yet
+        _set_watch_state(symbol,'BIAS_SET',direction,now_utc(),None)
+        return 'BIAS_SET','bias just set this cycle, waiting for 15M zone'
+
+    if row['state']=='BIAS_SET':
+        age=_minutes_since(row['bias_set_at'])
+        if age is not None and age>WATCH_BIAS_TIMEOUT_MIN:
+            _set_watch_state(symbol,'IDLE',None,None,None)
+            return 'IDLE',f'bias went stale after {WATCH_BIAS_TIMEOUT_MIN}min without reaching a zone'
+        if in_zone_now:
+            _set_watch_state(symbol,'ZONE_REACHED',direction,row['bias_set_at'],now_utc())
+            return 'ZONE_REACHED','zone just reached this cycle, waiting for 5M trigger'
+        return 'BIAS_SET',f'waiting for 15M zone ({age:.0f}min since bias set)' if age is not None else 'waiting for 15M zone'
+
+    if row['state']=='ZONE_REACHED':
+        age=_minutes_since(row['zone_reached_at'])
+        if age is not None and age>WATCH_ZONE_TIMEOUT_MIN:
+            _set_watch_state(symbol,'IDLE',None,None,None)
+            return 'IDLE',f'setup abandoned after {WATCH_ZONE_TIMEOUT_MIN}min in-zone without a trigger'
+        if trigger_now:
+            # Consumed -- reset to IDLE so the next real setup starts fresh
+            # rather than immediately re-triggering next cycle on stale state.
+            _set_watch_state(symbol,'IDLE',None,None,None)
+            return 'TRIGGERED','fresh 5M trigger confirmed after zone + bias'
+        return 'ZONE_REACHED',f'in zone, waiting for 5M trigger ({age:.0f}min)' if age is not None else 'in zone, waiting for 5M trigger'
+
+    return 'IDLE','unrecognized state, reset'
+
 def track_trades():
     with DB_LOCK:
         con=db(); rows=con.execute("SELECT * FROM trades WHERE status IN ('WAITING_ENTRY','OPEN')").fetchall(); con.close()
@@ -1295,17 +1448,41 @@ def scan_once(force=False):
         # actually scored now always gets its own row.
         candidates=[a for a in analyses if a.get('htf_bias_ok') and a.get('trend_regime_ok')]
         analyses.sort(key=lambda x: float(x.get('score',0)), reverse=True)
+
+        # Watch-state layer: on top of the hard filters, require a genuine
+        # multi-cycle progression (bias set -> price reaches a 15M zone ->
+        # a fresh 5M trigger) before a candidate is actually eligible this
+        # cycle, rather than acting the instant a single snapshot happens to
+        # show everything aligned at once. Opt-out via WATCH_STATE_ENABLED=0
+        # to restore the old immediate-eligibility behavior.
+        watch_notes={}
+        if WATCH_STATE_ENABLED:
+            triggered=[]
+            for a in analyses:
+                status,note=update_watch_state(a)
+                watch_notes[a['symbol']]=(status,note)
+                if status=='TRIGGERED':
+                    triggered.append(a)
+            candidates=triggered
+
         if not candidates:
             top=analyses[0]
             with DB_LOCK:
                 con=db(); now=now_utc()
                 for a in analyses:
                     ok_htf=a.get('htf_bias_ok'); ok_trend=a.get('trend_regime_ok')
-                    missing=', '.join(x for x,ok in [('htf_bias',ok_htf),('trend_regime',ok_trend)] if not ok)
+                    if not (ok_htf and ok_trend):
+                        missing=', '.join(x for x,ok in [('htf_bias',ok_htf),('trend_regime',ok_trend)] if not ok)
+                        d,reason='HARD_FILTER_FAIL',f'Failed hard filter: {missing}'
+                    elif a['symbol'] in watch_notes:
+                        status,note=watch_notes[a['symbol']]
+                        d,reason=f'WATCHING_{status}',note
+                    else:
+                        d,reason='HARD_FILTER_FAIL','n/a'
                     con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
-                                (now,a['symbol'],a['score'],'HARD_FILTER_FAIL',0,f'Failed hard filter: {missing}'))
+                                (now,a['symbol'],a['score'],d,0,reason))
                 con.commit(); con.close()
-            log.info('[SCAN] scores=%s | no candidate passed hard filters (best would-be: %s score=%.1f)',
+            log.info('[SCAN] scores=%s | no triggered candidate this cycle (best would-be: %s score=%.1f)',
                       ', '.join(f"{a['symbol']}:{a['score']}" for a in analyses), top['symbol'], float(top['score']))
             return result
         candidates.sort(key=lambda x: float(x.get('score',0)), reverse=True)
@@ -1316,13 +1493,16 @@ def scan_once(force=False):
         with DB_LOCK:
             con=db(); now=now_utc()
             for a in analyses:
-                if a.get('htf_bias_ok') and a.get('trend_regime_ok'):
-                    d='RANKED_WAIT' if a['symbol']!=best_symbol else 'BEST_PENDING'
-                    reason='Not highest score in this scan' if d=='RANKED_WAIT' else 'Highest score; MIN_SCORE pending'
-                else:
+                if not (a.get('htf_bias_ok') and a.get('trend_regime_ok')):
                     d='HARD_FILTER_FAIL'
                     missing=', '.join(x for x,ok in [('htf_bias',a.get('htf_bias_ok')),('trend_regime',a.get('trend_regime_ok'))] if not ok)
                     reason=f'Failed hard filter: {missing}'
+                elif a['symbol'] in watch_notes and watch_notes[a['symbol']][0]!='TRIGGERED':
+                    status,note=watch_notes[a['symbol']]
+                    d,reason=f'WATCHING_{status}',note
+                else:
+                    d='RANKED_WAIT' if a['symbol']!=best_symbol else 'BEST_PENDING'
+                    reason='Not highest score in this scan' if d=='RANKED_WAIT' else 'Highest score; MIN_SCORE pending'
                 con.execute('INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',(now,a['symbol'],a['score'],d,0,reason))
             con.commit(); con.close()
         # Only highest score reaches MIN_SCORE.
@@ -1488,7 +1668,7 @@ def send_trade_summary():
 
 # ----------------------------- Backtest / factor stats -----------------
 FACTOR_KEYS = ['htf_bias','trend_regime','liquidity_sweep','bos','order_block','choch',
-               'fvg','crt','tbs','candle_pattern','volume_expansion','momentum']
+               'fvg','crt','tbs','candle_pattern','volume_expansion','momentum','eqh_eql_pool']
 
 def _trade_r_multiple(row):
     """R-multiple actually achieved by a closed trade.
@@ -1670,7 +1850,3 @@ def setup_status():
     ai = request.args.get("ai", "").upper()
     result = classify_setup(score, {"decision": ai} if ai else None)
     return jsonify(result)
-
-
-
-
