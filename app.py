@@ -386,7 +386,7 @@ def _round_price(v):
         d = max(8, -int(math.floor(math.log10(av))) + 5)
     return round(v, d)
 
-def _compact_candles(candles, n=15):
+def _compact_candles(candles, n=30):
     """Token-lean candle payload for Gemini: short keys (o/h/l/c/v), adaptive
     rounding, and no open_time (array order already conveys recency -- oldest
     first, most recent last). Full float precision (e.g.
