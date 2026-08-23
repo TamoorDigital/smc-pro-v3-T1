@@ -386,7 +386,7 @@ def _round_price(v):
         d = max(8, -int(math.floor(math.log10(av))) + 5)
     return round(v, d)
 
-def _compact_candles(candles, n=30):
+def _compact_candles(candles, n=15):
     """Token-lean candle payload for Gemini: short keys (o/h/l/c/v), adaptive
     rounding, and no open_time (array order already conveys recency -- oldest
     first, most recent last). Full float precision (e.g.
@@ -2000,7 +2000,17 @@ def dashboard():
 #      become a weight optimizer from tiny samples.
 
 ENABLE_PENDING_LIMITS = os.getenv('ENABLE_PENDING_LIMITS', '0').strip().lower() in ('1','true','yes','on')
-MAX_GEMINI_CANDIDATES = max(1, int(os.getenv('MAX_GEMINI_CANDIDATES', '2')))
+MAX_GEMINI_CANDIDATES = max(1, int(os.getenv('MAX_GEMINI_CANDIDATES', '3')))
+MAX_CONCURRENT_TRADES = max(1, int(os.getenv('MAX_CONCURRENT_TRADES', '3')))
+
+def count_open_trades():
+    with DB_LOCK:
+        con=db()
+        row=con.execute(
+            "SELECT COUNT(*) c FROM trades WHERE status IN ('WAITING_ENTRY','OPEN','PENDING_LIMIT')"
+        ).fetchone()
+        con.close()
+    return int(row['c']) if row else 0
 MIN_DIRECTION_GAP = max(0.0, float(os.getenv('MIN_DIRECTION_GAP', '8')))
 FVG_MIN_ATR = max(0.01, float(os.getenv('FVG_MIN_ATR', '0.15')))
 OB_MIN_DISPLACEMENT_ATR = max(0.05, float(os.getenv('OB_MIN_DISPLACEMENT_ATR', '0.35')))
@@ -2336,6 +2346,26 @@ def build_analysis(symbol):
         tp1,tp2,tp3=_choose_targets(a1,a2,direction,entry,risk)
         flags=flags_by_dir[direction]
 
+    # Real structural reference points (from the SAME quant detectors that
+    # scored this setup) -- kept separately from the trade levels so
+    # Gemini's own SL/TP can later be cross-checked against actual
+    # swing/sweep structure instead of being trusted at face value.
+    structure_levels={
+        'swing_highs':[p for _,p in (a1.get('swing_highs') or [])]
+                      +[p for _,p in (a2.get('swing_highs') or [])]
+                      +[p for _,p in (a3.get('swing_highs') or [])],
+        'swing_lows':[p for _,p in (a1.get('swing_lows') or [])]
+                     +[p for _,p in (a2.get('swing_lows') or [])]
+                     +[p for _,p in (a3.get('swing_lows') or [])],
+        'bull_sweep_level':a3.get('bull_sweep_level'),
+        'bear_sweep_level':a3.get('bear_sweep_level'),
+        'atr_5m':a3.get('atr'),
+    }
+    if direction is not None:
+        zone=detect_zone(c2,direction)
+        if zone:
+            structure_levels['zone_low']=zone['low']; structure_levels['zone_high']=zone['high']
+
     a.update({
         'direction':direction or 'NONE',
         'score':round(best_score,2),
@@ -2346,6 +2376,7 @@ def build_analysis(symbol):
         'htf_bias_ok':bool(hard_htf),
         'trend_regime_ok':bool(hard_trend),
         'zone_entry':None,
+        'structure_levels':structure_levels,
     })
     return a
 
@@ -2389,6 +2420,82 @@ Return ONLY JSON:
  "reason":"brief evidence-based reason"
 }"""
     return gemini_json(system,prompt,max_output_tokens=1800)
+
+SL_STRUCTURE_TOLERANCE_ATR = max(0.1, float(os.getenv('SL_STRUCTURE_TOLERANCE_ATR', '1.5')))
+
+def _verify_sl_against_structure(direction, sl, structure_levels):
+    """Cross-checks Gemini's proposed SL against the SAME structural points
+    quant's own detectors found (swing highs/lows, the confirmed sweep
+    level, the order-block/FVG zone edge) on the same candles -- rather
+    than trusting whatever number Gemini returns.
+
+    A structurally sound SL for a LONG sits just below a real swing low /
+    sweep low / OB low; for a SHORT, just above a real swing high / sweep
+    high / OB high. If Gemini's SL isn't within tolerance of ANY of these,
+    it's most likely an arbitrary/rounded number rather than something
+    actually anchored to price structure, and the trade is rejected
+    rather than sent out.
+
+    Returns (ok: bool, reason: str, nearest_ref: float|None).
+    """
+    if sl is None:
+        return False, 'No SL provided', None
+    atrv = structure_levels.get('atr_5m') or abs(sl)*0.005 or 1e-9
+
+    if direction == 'LONG':
+        refs = [p for p in structure_levels.get('swing_lows', []) if p is not None]
+        sweep = structure_levels.get('bull_sweep_level')
+        if sweep is not None:
+            refs.append(sweep)
+        if structure_levels.get('zone_low') is not None:
+            refs.append(structure_levels['zone_low'])
+        # SL must sit within tolerance of a real reference point -- not
+        # merely "somewhere below" one, which would pass for any SL that's
+        # far away in the correct direction.
+        candidates = [r for r in refs if abs(sl-r) <= SL_STRUCTURE_TOLERANCE_ATR*atrv]
+    else:
+        refs = [p for p in structure_levels.get('swing_highs', []) if p is not None]
+        sweep = structure_levels.get('bear_sweep_level')
+        if sweep is not None:
+            refs.append(sweep)
+        if structure_levels.get('zone_high') is not None:
+            refs.append(structure_levels['zone_high'])
+        candidates = [r for r in refs if abs(sl-r) <= SL_STRUCTURE_TOLERANCE_ATR*atrv]
+
+    if not refs:
+        return False, 'No structural reference points available to verify against', None
+    if not candidates:
+        nearest = min(refs, key=lambda r: abs(r-sl))
+        dist_atr = abs(sl-nearest)/atrv
+        return False, (f'SL {sl:.6g} is {dist_atr:.1f} ATR away from the nearest real '
+                        f'structure point ({nearest:.6g}) -- looks unanchored, not structural'), nearest
+    nearest = min(candidates, key=lambda r: abs(r-sl))
+    return True, f'SL anchored near real structure at {nearest:.6g}', nearest
+
+
+def _correct_sl_to_structure(direction, entry, g_sl, g_tp1, g_tp2, g_tp3, nearest_ref, atrv):
+    """Gemini's SL failed the structure check -- rather than throwing away
+    an otherwise-good setup, rebuild SL from the REAL structural point
+    quant found closest to what Gemini proposed (same placement formula
+    quant itself uses: structural point +/- 0.25 ATR, with a 0.60 ATR
+    floor off entry), then re-anchor TP1/2/3 at the SAME R-multiples
+    Gemini intended, scaled to the corrected risk.
+    Returns (sl, tp1, tp2, tp3).
+    """
+    if direction == 'LONG':
+        sl = min(nearest_ref - 0.25*atrv, entry - 0.60*atrv)
+    else:
+        sl = max(nearest_ref + 0.25*atrv, entry + 0.60*atrv)
+
+    orig_risk = abs(entry - g_sl) or 1e-9
+    new_risk = abs(entry - sl)
+
+    def _rescale(tp):
+        mult = abs(tp - entry) / orig_risk
+        return entry + mult*new_risk if direction == 'LONG' else entry - mult*new_risk
+
+    return sl, _rescale(g_tp1), _rescale(g_tp2), _rescale(g_tp3)
+
 
 def structure_agreement(quant_flags, ai):
     pairs=[('bos','bos_detected'),('choch','choch_detected'),
@@ -2435,6 +2542,9 @@ def scan_once(force=False):
     result={'time':now_utc(),'symbols':{},'best':None}
     analyses=[]; scan_errors=[]
     try:
+        if count_open_trades() >= MAX_CONCURRENT_TRADES:
+            result['status']=f'max concurrent trades reached ({MAX_CONCURRENT_TRADES})'
+            return result
         for symbol in WATCHLIST:
             try:
                 a=build_analysis(symbol)
@@ -2538,17 +2648,50 @@ def scan_once(force=False):
                         reason='Gemini approval missing valid trade levels'
                     else:
                         ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
-                        if ok:
-                            trade_plan=dict(best)
-                            trade_plan.update({
-                                'direction':g_direction,'entry':g_entry,'sl':g_sl,
-                                'tp1':g_tp1,'tp2':g_tp2,'tp3':g_tp3,
-                                'rr':abs(g_tp2-g_entry)/max(abs(g_entry-g_sl),1e-12)
-                            })
-                            approved=True
-                            reason=ai.get('reason',why)
-                        else:
+                        if not ok:
                             reason=why
+                        else:
+                            # Ordering/R:R sane != actually grounded in
+                            # structure. Cross-check Gemini's SL against the
+                            # SAME swing/sweep/OB levels quant's own
+                            # detectors found on these candles, before
+                            # trusting it enough to send out.
+                            sl_ok,sl_why,nearest_ref=_verify_sl_against_structure(
+                                g_direction,g_sl,best.get('structure_levels',{})
+                            )
+                            if sl_ok:
+                                final_sl,final_tp1,final_tp2,final_tp3=g_sl,g_tp1,g_tp2,g_tp3
+                                level_note=sl_why
+                            elif nearest_ref is not None:
+                                # Don't throw away an otherwise-approved setup
+                                # over a badly-placed SL number -- rebuild SL
+                                # from the REAL structural point closest to
+                                # what Gemini proposed (quant's own placement
+                                # formula), and re-anchor TP1/2/3 at Gemini's
+                                # intended R-multiples off the corrected risk.
+                                atrv=best.get('structure_levels',{}).get('atr_5m') or abs(g_entry)*0.005
+                                final_sl,final_tp1,final_tp2,final_tp3=_correct_sl_to_structure(
+                                    g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3,nearest_ref,atrv
+                                )
+                                level_note=f'SL auto-corrected to structure ({sl_why})'
+                            else:
+                                final_sl=None; level_note=sl_why
+
+                            if final_sl is None:
+                                reason=f'SL structure check failed, no structural reference to correct to: {sl_why}'
+                            else:
+                                ok2,why2=_final_level_check(g_direction,g_entry,final_sl,final_tp1,final_tp2,final_tp3)
+                                if not ok2:
+                                    reason=f'SL-corrected levels still invalid: {why2} ({level_note})'
+                                else:
+                                    trade_plan=dict(best)
+                                    trade_plan.update({
+                                        'direction':g_direction,'entry':g_entry,'sl':final_sl,
+                                        'tp1':final_tp1,'tp2':final_tp2,'tp3':final_tp3,
+                                        'rr':abs(final_tp2-g_entry)/max(abs(g_entry-final_sl),1e-12)
+                                    })
+                                    approved=True
+                                    reason=ai.get('reason',why)+f' | {level_note}'
 
             decision='APPROVED' if approved else 'REJECTED'
             with DB_LOCK:
