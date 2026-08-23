@@ -279,6 +279,10 @@ def init_db():
             con.execute('ALTER TABLE trades ADD COLUMN effective_sl REAL')
         except sqlite3.OperationalError:
             pass
+        try:
+            con.execute('ALTER TABLE trades ADD COLUMN pending_multipliers_json TEXT')
+        except sqlite3.OperationalError:
+            pass
         con.commit(); con.close()
 
 def state_get(key, default=None):
@@ -832,6 +836,14 @@ def build_analysis(symbol):
     # R:R is calculated after entry/SL/TP plan.
     direction=max(scores, key=scores.get); base=scores[direction]
     price=a3['price']; a=a3['atr'] or (price*0.005)
+    # Zone bounds for the WINNING direction -- exposed so a limit-order can
+    # be placed at the zone's near edge (waiting for price to pull back into
+    # it) rather than only ever reading confluence at whatever price happens
+    # to be RIGHT NOW.
+    _zone=detect_zone(c2,direction) or detect_fvg(c2,direction)
+    zone_entry=None
+    if _zone:
+        zone_entry=_zone['high'] if direction=='LONG' else _zone['low']
     # Structural SL: placed below/above the actual recent swing low/high (not
     # just a fixed ATR multiple from the current price), with a small ATR
     # buffer on top so normal noise doesn't tag it. A fixed "price - 1.2*ATR"
@@ -964,6 +976,7 @@ def build_analysis(symbol):
         # before even spending a Gemini call on it.
         'htf_bias_ok': a1['bias'] in ('BULLISH','BEARISH') and factor_flags['htf_bias'] and ema200_aligned,
         'trend_regime_ok': trend_regime_ok,
+        'zone_entry': _round_price(zone_entry) if zone_entry else None,
         'structure_flags':{
             'choch':choch,
             'fvg':{d:(fvg_hits[d] if fvg_hits.get(d) else None) for d in ('LONG','SHORT')},
@@ -1143,8 +1156,89 @@ def insert_trade(a, ai):
 
 def has_open_similar(symbol,direction):
     with DB_LOCK:
-        con=db(); row=con.execute("SELECT 1 FROM trades WHERE symbol=? AND direction=? AND status IN ('WAITING_ENTRY','OPEN') LIMIT 1",(symbol,direction)).fetchone(); con.close()
+        con=db(); row=con.execute("SELECT 1 FROM trades WHERE symbol=? AND direction=? AND status IN ('WAITING_ENTRY','OPEN','PENDING_LIMIT') LIMIT 1",(symbol,direction)).fetchone(); con.close()
     return bool(row)
+
+PENDING_LIMIT_MIN_SCORE = max(0, int(os.getenv('PENDING_LIMIT_MIN_SCORE', str(MIN_SCORE))))
+PENDING_LIMIT_TIMEOUT_MIN = max(0, int(os.getenv('PENDING_LIMIT_TIMEOUT_MIN', '150')))
+
+def insert_pending_limit(a):
+    """A limit-order 'watch' -- created as soon as a good-scoring setup
+    reaches its 15M zone (ZONE_REACHED), rather than waiting for the full
+    5M sweep/BOS/CHoCH trigger through Gemini. Skips Gemini entirely: the
+    whole point of a limit order sitting at the zone is that it can't be
+    "chasing" an extended move (Gemini's #1 rejection reason) -- that risk
+    is structurally avoided by construction. SL/TP stored here are only
+    PROVISIONAL (from the original ATR-based analysis); track_pending_limits
+    refines them from the real sweep candle once the order actually fills."""
+    entry=a.get('zone_entry') or a['entry']
+    risk_orig=abs(a['entry']-a['sl']) or 1e-9
+    multipliers={
+        'tp1': abs(a['tp1']-a['entry'])/risk_orig,
+        'tp2': abs(a['tp2']-a['entry'])/risk_orig,
+        'tp3': abs(a['tp3']-a['entry'])/risk_orig,
+    }
+    factors_json=json.dumps({'quant': a.get('factor_flags', {}), 'quant_score': a.get('score'), 'gemini': None, 'note': 'pending_limit -- no Gemini call'})
+    with DB_LOCK:
+        con=db(); cur=con.execute('''INSERT INTO trades(symbol,direction,entry,sl,tp1,tp2,tp3,score,ai_confidence,ai_reason,framework,created_at,factors_json,effective_sl,pending_multipliers_json,status)
+                                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+          (a['symbol'],a['direction'],entry,a['sl'],a['tp1'],a['tp2'],a['tp3'],a['score'],0,
+           'Limit order watch -- SL/TP provisional, refined at fill from the real sweep candle',
+           FRAMEWORK,now_utc(),factors_json,a['sl'],json.dumps(multipliers),'PENDING_LIMIT'))
+        con.commit(); tid=cur.lastrowid; con.close()
+    return tid
+
+def track_pending_limits():
+    with DB_LOCK:
+        con=db(); rows=con.execute("SELECT * FROM trades WHERE status='PENDING_LIMIT'").fetchall(); con.close()
+    for row in rows:
+        try:
+            if PENDING_LIMIT_TIMEOUT_MIN>0:
+                age=_minutes_since(row['created_at'])
+                if age is not None and age>PENDING_LIMIT_TIMEOUT_MIN:
+                    with DB_LOCK:
+                        con=db(); con.execute("UPDATE trades SET status='CLOSED', final_result='EXPIRED_NO_ENTRY', close_time=? WHERE id=?",(now_utc(),row['id'])); con.commit(); con.close()
+                    telegram_send(f'⌛ *LIMIT ORDER EXPIRED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\nZone `{fmt_price(row["entry"])}` never filled within {PENDING_LIMIT_TIMEOUT_MIN}min -- cancelled.')
+                    continue
+            candles=fetch_tracking_candle(row['symbol'],6)
+            if not candles: continue
+            c=candles[-1]; direction=row['direction']; entry=row['entry']
+            filled = (c['low']<=entry) if direction=='LONG' else (c['high']>=entry)
+            if not filled: continue
+            # FILLED: read the real sweep candle's own low/high (not the
+            # original ATR-based guess from when the zone was first
+            # detected) to place the actual SL, then rebuild TP1/2/3
+            # proportionally using the same R:R multipliers the original
+            # analysis chose based on confluence strength.
+            atr_candles=fetch_klines(row['symbol'], TRACK_TIMEFRAME, 30)
+            a_atr=atr(atr_candles) if atr_candles else abs(entry-row['sl'])*0.3
+            try:
+                mult=json.loads(row['pending_multipliers_json'] or '{}')
+            except (json.JSONDecodeError, TypeError):
+                mult={}
+            m1=mult.get('tp1',1.5); m2=mult.get('tp2',2.3); m3=mult.get('tp3',3.2)
+            if direction=='LONG':
+                real_sweep_low=min(x['low'] for x in candles[-3:])
+                new_sl=min(real_sweep_low-0.3*a_atr, entry-0.6*a_atr)
+                risk=entry-new_sl
+                new_tp1=entry+m1*risk; new_tp2=entry+m2*risk; new_tp3=entry+m3*risk
+            else:
+                real_sweep_high=max(x['high'] for x in candles[-3:])
+                new_sl=max(real_sweep_high+0.3*a_atr, entry+0.6*a_atr)
+                risk=new_sl-entry
+                new_tp1=entry-m1*risk; new_tp2=entry-m2*risk; new_tp3=entry-m3*risk
+            with DB_LOCK:
+                con=db(); con.execute('''UPDATE trades SET status='WAITING_ENTRY', sl=?, effective_sl=?, tp1=?, tp2=?, tp3=?,
+                                          ai_reason='Limit order filled -- SL/TP finalized from real sweep candle' WHERE id=?''',
+                                       (new_sl,new_sl,new_tp1,new_tp2,new_tp3,row['id'])); con.commit(); con.close()
+            telegram_send(
+                f'🎯 *LIMIT ORDER FILLED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\n'
+                f'Entry: `{fmt_price(entry)}` (filled)\nSL (from real sweep): `{fmt_price(new_sl)}`\n'
+                f'TP1: `{fmt_price(new_tp1)}` | TP2: `{fmt_price(new_tp2)}` | TP3: `{fmt_price(new_tp3)}`\n'
+                f'Quant Score: `{row["score"]:.0f}/100` (no Gemini call -- limit-order path)'
+            )
+        except Exception as e:
+            log.warning('pending-limit tracker %s: %s',row['symbol'],e)
 
 SYMBOL_LOSS_COOLDOWN_MIN = max(0, int(os.getenv('SYMBOL_LOSS_COOLDOWN_MIN', '120')))
 
@@ -1463,6 +1557,21 @@ def scan_once(force=False):
                 watch_notes[a['symbol']]=(status,note)
                 if status=='TRIGGERED':
                     triggered.append(a)
+                elif status=='ZONE_REACHED' and float(a.get('score',0))>=PENDING_LIMIT_MIN_SCORE:
+                    # Good-scoring setup has reached its zone but hasn't
+                    # produced a fresh 5M trigger yet -- rather than silently
+                    # wait (and risk missing a fill that happens between two
+                    # 5-minute scan cycles), place a tracked limit order at
+                    # the zone right now. No Gemini call for this path -- see
+                    # insert_pending_limit for why that's fine here.
+                    if not has_open_similar(a['symbol'], a['direction']):
+                        pid=insert_pending_limit(a)
+                        telegram_send(
+                            f'👀 *LIMIT ORDER PLACED — {a["symbol"]} {a["direction"]}*\nTrade #{pid}\n'
+                            f'Watching for fill at `{fmt_price(a.get("zone_entry") or a["entry"])}`\n'
+                            f'Quant Score: `{float(a["score"]):.0f}/100`\nSL/TP will be finalized once it fills.'
+                        )
+                    watch_notes[a['symbol']]=('ZONE_REACHED','limit order placed at zone, waiting for fill')
             candidates=triggered
 
         if not candidates:
@@ -1599,6 +1708,7 @@ def scheduled_scan():
 
 def scheduled_track():
     track_trades()
+    track_pending_limits()
 
 # ----------------------------- Telegram commands ----------------------
 def telegram_poll():
@@ -1654,14 +1764,15 @@ def stats():
     with DB_LOCK:
         con=db(); row=con.execute('''SELECT COUNT(*) total,
             SUM(status IN ('WAITING_ENTRY','OPEN')) open,
+            SUM(status='PENDING_LIMIT') pending,
             SUM(final_result='EXPIRED_NO_ENTRY') expired,
             SUM(final_result='TP3_WIN') wins,
             SUM(final_result='SL_LOSS') losses,
             SUM(final_result LIKE 'TP%\\_LOCKED\\_SL' ESCAPE '\\') partials
             FROM trades''').fetchone(); con.close()
-    total=row['total'] or 0; open_=row['open'] or 0; expired=row['expired'] or 0
-    closed=total-open_-expired; wins=row['wins'] or 0
-    return {'total':total,'open':open_,'expired':expired,'closed':closed,'wins':wins,'losses':row['losses'] or 0,'partials':row['partials'] or 0,'win_rate':round(wins/closed*100,2) if closed else 0}
+    total=row['total'] or 0; open_=row['open'] or 0; pending=row['pending'] or 0; expired=row['expired'] or 0
+    closed=total-open_-pending-expired; wins=row['wins'] or 0
+    return {'total':total,'open':open_,'pending':pending,'expired':expired,'closed':closed,'wins':wins,'losses':row['losses'] or 0,'partials':row['partials'] or 0,'win_rate':round(wins/closed*100,2) if closed else 0}
 
 def send_trade_summary():
     s=stats(); telegram_send(f'📊 *TRADE STATS*\nTotal: `{s["total"]}`\nOpen: `{s["open"]}`\nWins: `{s["wins"]}`\nLosses: `{s["losses"]}`\nPartial: `{s["partials"]}`\nWin rate: `{s["win_rate"]}%`')
@@ -1805,8 +1916,14 @@ def api_reset():
 def dashboard():
     s=stats()
     with DB_LOCK:
-        con=db(); trades=[dict(x) for x in con.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 50').fetchall()]; scans=[dict(x) for x in con.execute('SELECT * FROM scans ORDER BY id DESC LIMIT 30').fetchall()]; con.close()
+        con=db(); trades=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status!='PENDING_LIMIT' ORDER BY id DESC LIMIT 50").fetchall()]
+        pending=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='PENDING_LIMIT' ORDER BY id DESC LIMIT 30").fetchall()]
+        scans=[dict(x) for x in con.execute('SELECT * FROM scans ORDER BY id DESC LIMIT 30').fetchall()]; con.close()
     rows=''.join(f'<tr><td>#{t["id"]}</td><td>{t["symbol"]}</td><td>{t["direction"]}</td><td>{t["score"]}</td><td>{t["status"]}</td><td>{t["highest_tp"] or 0}</td><td>{t["final_result"] or "—"}</td></tr>' for t in trades)
+    pendrows=''.join(
+        f'<tr><td>#{p["id"]}</td><td>{p["symbol"]}</td><td>{p["direction"]}</td><td>{p["score"]}</td>'
+        f'<td>{fmt_price(p["entry"])}</td><td>{p["created_at"]}</td></tr>' for p in pending
+    )
     scanrows=''.join(f'<tr><td>{x["time"]}</td><td>{x["symbol"]}</td><td>{x["score"]}</td><td>{x["decision"]}</td><td>{"YES" if x["gemini_called"] else "NO"}</td><td>{x["reason"] or "—"}</td></tr>' for x in scans)
     bt=factor_backtest_report()
     if bt.get('note'):
@@ -1823,7 +1940,7 @@ def dashboard():
             f'<td>{"✅" if v["reliable_sample"] else "low sample"}</td></tr>'
             for k,v in bt['factors'].items()
         )
-    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>body{{font-family:Arial;background:#080b0f;color:#d7e0ea;margin:0;padding:24px}}h1{{color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:#11161d;border:1px solid #252d36;border-radius:12px;padding:16px}}.n{{font-size:25px;color:#fff;font-weight:700}}table{{width:100%;border-collapse:collapse;margin-top:12px;background:#0e1319}}th,td{{padding:9px;border-bottom:1px solid #202730;text-align:left;font-size:12px}}td:last-child{{color:#9aa7b5;max-width:340px}}button{{padding:10px 14px;border:0;border-radius:8px;background:#ef4444;color:#fff;font-weight:700;cursor:pointer}}a{{color:#60a5fa}}section{{margin-top:28px}}</style></head><body><h1>⚡ SMC AI PRO</h1><p>Framework: <b>{FRAMEWORK}</b> · Timeframes: <b>{" → ".join(TIMEFRAMES)}</b> · Scanner: <b>{"ON" if scanner_is_active() else "OFF"}</b> · Tracker: <b>ON</b></p><div class="grid"><div class="card">Total<div class="n">{s['total']}</div></div><div class="card">Open<div class="n">{s['open']}</div></div><div class="card">Wins<div class="n">{s['wins']}</div></div><div class="card">Losses<div class="n">{s['losses']}</div></div><div class="card">Partial<div class="n">{s['partials']}</div></div><div class="card">Win rate<div class="n">{s['win_rate']}%</div></div></div><section><button onclick="resetAll()">Reset All Trade Statistics</button> <a href="/health">Health</a> <a href="/api/trades">Trades JSON</a> <a href="/api/backtest">Backtest JSON</a> <a href="/run-now">Run Now</a></section><section><h2>Trade Tracking</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th><th>Result</th></tr>{rows or '<tr><td colspan="7">No tracked trades</td></tr>'}</table></section><section><h2>Factor Backtest — closed trades only ({bt.get("total_closed_with_factors",0)} sampled)</h2><table><tr><th>Factor</th><th>Win rate WITH it</th><th>Win rate WITHOUT it</th><th>Edge</th><th>Sample</th></tr>{btrows or '<tr><td colspan="5">No data yet</td></tr>'}</table></section><section><h2>Scan Log</h2><table><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>Gemini</th><th>Reason</th></tr>{scanrows or '<tr><td colspan="6">No scans</td></tr>'}</table></section><script>async function resetAll(){{if(!confirm('Delete ALL trades and scan history?'))return;let r=await fetch('/api/reset',{{method:'POST'}});if(r.ok)location.reload();else alert('Reset failed');}}</script></body></html>'''
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>body{{font-family:Arial;background:#080b0f;color:#d7e0ea;margin:0;padding:24px}}h1{{color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:#11161d;border:1px solid #252d36;border-radius:12px;padding:16px}}.n{{font-size:25px;color:#fff;font-weight:700}}table{{width:100%;border-collapse:collapse;margin-top:12px;background:#0e1319}}th,td{{padding:9px;border-bottom:1px solid #202730;text-align:left;font-size:12px}}td:last-child{{color:#9aa7b5;max-width:340px}}button{{padding:10px 14px;border:0;border-radius:8px;background:#ef4444;color:#fff;font-weight:700;cursor:pointer}}a{{color:#60a5fa}}section{{margin-top:28px}}</style></head><body><h1>⚡ SMC AI PRO</h1><p>Framework: <b>{FRAMEWORK}</b> · Timeframes: <b>{" → ".join(TIMEFRAMES)}</b> · Scanner: <b>{"ON" if scanner_is_active() else "OFF"}</b> · Tracker: <b>ON</b></p><div class="grid"><div class="card">Total<div class="n">{s['total']}</div></div><div class="card">Open<div class="n">{s['open']}</div></div><div class="card">Pending Limits<div class="n">{s['pending']}</div></div><div class="card">Wins<div class="n">{s['wins']}</div></div><div class="card">Losses<div class="n">{s['losses']}</div></div><div class="card">Partial<div class="n">{s['partials']}</div></div><div class="card">Win rate<div class="n">{s['win_rate']}%</div></div></div><section><button onclick="resetAll()">Reset All Trade Statistics</button> <a href="/health">Health</a> <a href="/api/trades">Trades JSON</a> <a href="/api/backtest">Backtest JSON</a> <a href="/run-now">Run Now</a></section><section><h2>Order Limits — watching for fill</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Zone Entry</th><th>Placed At</th></tr>{pendrows or '<tr><td colspan="6">No pending limit orders</td></tr>'}</table></section><section><h2>Trade Tracking</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th><th>Result</th></tr>{rows or '<tr><td colspan="7">No tracked trades</td></tr>'}</table></section><section><h2>Factor Backtest — closed trades only ({bt.get("total_closed_with_factors",0)} sampled)</h2><table><tr><th>Factor</th><th>Win rate WITH it</th><th>Win rate WITHOUT it</th><th>Edge</th><th>Sample</th></tr>{btrows or '<tr><td colspan="5">No data yet</td></tr>'}</table></section><section><h2>Scan Log</h2><table><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>Gemini</th><th>Reason</th></tr>{scanrows or '<tr><td colspan="6">No scans</td></tr>'}</table></section><script>async function resetAll(){{if(!confirm('Delete ALL trades and scan history?'))return;let r=await fetch('/api/reset',{{method:'POST'}});if(r.ok)location.reload();else alert('Reset failed');}}</script></body></html>'''
 
 # ----------------------------- Startup --------------------------------
 init_db()
