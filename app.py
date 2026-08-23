@@ -194,7 +194,7 @@ GEMINI_TIMEOUT = int(os.getenv('GEMINI_TIMEOUT_SECONDS', '60'))
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DATA_DIR = os.getenv('DATA_DIR', './data')
-RESET_ON_START = os.getenv('RESET_ON_START', '1').strip().lower() in ('1','true','yes','on')
+RESET_ON_START = os.getenv('RESET_ON_START', '0').strip().lower() in ('1','true','yes','on')
 TELEGRAM_AUTO_BIND = os.getenv('TELEGRAM_AUTO_BIND', '1').strip().lower() in ('1','true','yes','on')
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, 'smc_pro.db')
@@ -1963,16 +1963,1002 @@ def dashboard():
     else:
         def _cell(g):
             if g['trades']==0: return '—'
-            r=f"{g['win_rate']}% ({g['trades']})"
+            r=f"{g.get('tp3_win_rate')}% ({g['trades']})"
             if g['avg_r'] is not None: r+=f" · avg {g['avg_r']}R"
             return r
         btrows=''.join(
             f'<tr><td>{k.replace("_"," ")}</td><td>{_cell(v["with_factor"])}</td><td>{_cell(v["without_factor"])}</td>'
-            f'<td>{("+" if (v["edge_win_rate_pts"] or 0)>=0 else "")}{v["edge_win_rate_pts"]}pt</td>'
+            f'<td>{("+" if (v.get("edge_tp3_win_rate_pts") or 0)>=0 else "")}{v.get("edge_tp3_win_rate_pts")}pt</td>'
             f'<td>{"✅" if v["reliable_sample"] else "low sample"}</td></tr>'
             for k,v in bt['factors'].items()
         )
     return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>body{{font-family:Arial;background:#080b0f;color:#d7e0ea;margin:0;padding:24px}}h1{{color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:#11161d;border:1px solid #252d36;border-radius:12px;padding:16px}}.n{{font-size:25px;color:#fff;font-weight:700}}table{{width:100%;border-collapse:collapse;margin-top:12px;background:#0e1319}}th,td{{padding:9px;border-bottom:1px solid #202730;text-align:left;font-size:12px}}td:last-child{{color:#9aa7b5;max-width:340px}}button{{padding:10px 14px;border:0;border-radius:8px;background:#ef4444;color:#fff;font-weight:700;cursor:pointer}}a{{color:#60a5fa}}section{{margin-top:28px}}</style></head><body><h1>⚡ SMC AI PRO</h1><p>Framework: <b>{FRAMEWORK}</b> · Timeframes: <b>{" → ".join(TIMEFRAMES)}</b> · Scanner: <b>{"ON" if scanner_is_active() else "OFF"}</b> · Tracker: <b>ON</b></p><div class="grid"><div class="card">Total<div class="n">{s['total']}</div></div><div class="card">Open<div class="n">{s['open']}</div></div><div class="card">Pending Limits<div class="n">{s['pending']}</div></div><div class="card">Wins<div class="n">{s['wins']}</div></div><div class="card">Losses<div class="n">{s['losses']}</div></div><div class="card">Partial<div class="n">{s['partials']}</div></div><div class="card">Win rate<div class="n">{s['win_rate']}%</div></div></div><section><button onclick="resetAll()">Reset All Trade Statistics</button> <a href="/health">Health</a> <a href="/api/trades">Trades JSON</a> <a href="/api/backtest">Backtest JSON</a> <a href="/run-now">Run Now</a></section><section><h2>Order Limits — watching for fill</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Zone Entry</th><th>Placed At</th></tr>{pendrows or '<tr><td colspan="6">No pending limit orders</td></tr>'}</table></section><section><h2>Trade Tracking</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th><th>Result</th></tr>{rows or '<tr><td colspan="7">No tracked trades</td></tr>'}</table></section><section><h2>Factor Backtest — closed trades only ({bt.get("total_closed_with_factors",0)} sampled)</h2><table><tr><th>Factor</th><th>Win rate WITH it</th><th>Win rate WITHOUT it</th><th>Edge</th><th>Sample</th></tr>{btrows or '<tr><td colspan="5">No data yet</td></tr>'}</table></section><section><h2>Scan Log</h2><table><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>Gemini</th><th>Reason</th></tr>{scanrows or '<tr><td colspan="6">No scans</td></tr>'}</table></section><script>async function resetAll(){{if(!confirm('Delete ALL trades and scan history?'))return;let r=await fetch('/api/reset',{{method:'POST'}});if(r.ok)location.reload();else alert('Reset failed');}}</script></body></html>'''
+
+
+
+# ===================== FINAL STRATEGY AUDIT PATCH v2 =====================
+# This replaces the earlier audit patch with one coherent execution/evaluation
+# path.  Key goals:
+#   1) hard filters -> watch state -> trigger -> rank -> Gemini
+#   2) no unvalidated limit orders by default
+#   3) Gemini is genuinely independent of quant score/reasons
+#   4) structure agreement counts positive agreement, not False/False
+#   5) BOS/CHOCH/sweep use confirmed swings
+#   6) OB/FVG require displacement + freshness
+#   7) CRT/TBS are one confirmation group, max +4
+#   8) targets are structural liquidity first, not "number of reasons"
+#   9) top N candidates can reach Gemini instead of only #1
+#  10) statistics report TP1/TP2/positive-rate/expectancy and separate paths
+#  11) factor report is explicitly forward/observational; it cannot silently
+#      become a weight optimizer from tiny samples.
+
+ENABLE_PENDING_LIMITS = os.getenv('ENABLE_PENDING_LIMITS', '0').strip().lower() in ('1','true','yes','on')
+MAX_GEMINI_CANDIDATES = max(1, int(os.getenv('MAX_GEMINI_CANDIDATES', '2')))
+MIN_DIRECTION_GAP = max(0.0, float(os.getenv('MIN_DIRECTION_GAP', '8')))
+FVG_MIN_ATR = max(0.01, float(os.getenv('FVG_MIN_ATR', '0.15')))
+OB_MIN_DISPLACEMENT_ATR = max(0.05, float(os.getenv('OB_MIN_DISPLACEMENT_ATR', '0.35')))
+MIN_STRUCTURE_AGREEMENTS = max(1, int(os.getenv('MIN_STRUCTURE_AGREEMENTS', '2')))
+MAX_STRUCTURE_DISAGREEMENT = min(1.0, max(0.0, float(os.getenv('MAX_STRUCTURE_DISAGREEMENT', '0.50'))))
+FACTOR_MIN_SAMPLE = max(10, int(os.getenv('FACTOR_MIN_SAMPLE', '20')))
+INTRABAR_POLICY = os.getenv('INTRABAR_POLICY', 'conservative').strip().lower()
+if INTRABAR_POLICY not in ('conservative', 'optimistic', 'unknown'):
+    INTRABAR_POLICY = 'conservative'
+
+_build_analysis_legacy = build_analysis
+_insert_trade_legacy = insert_trade
+_insert_pending_limit_legacy = insert_pending_limit
+
+# ---------------- Schema migration ----------------
+def init_db():
+    with DB_LOCK:
+        con = db()
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL, direction TEXT NOT NULL,
+            entry REAL NOT NULL, sl REAL NOT NULL,
+            tp1 REAL, tp2 REAL, tp3 REAL,
+            score INTEGER, ai_confidence INTEGER,
+            ai_reason TEXT, framework TEXT,
+            created_at TEXT NOT NULL, entry_time TEXT,
+            status TEXT NOT NULL DEFAULT 'WAITING_ENTRY',
+            tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0, tp3_hit INTEGER DEFAULT 0,
+            highest_tp INTEGER DEFAULT 0, sl_hit INTEGER DEFAULT 0,
+            final_result TEXT, close_time TEXT,
+            last_price REAL, last_checked TEXT
+        );
+        CREATE TABLE IF NOT EXISTS scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            time TEXT, symbol TEXT, score INTEGER, decision TEXT,
+            gemini_called INTEGER DEFAULT 0, reason TEXT
+        );
+        CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS watch_state (
+            symbol TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'IDLE',
+            direction TEXT, bias_set_at TEXT, zone_reached_at TEXT, last_updated TEXT
+        );
+        """)
+        for col, typ in [
+            ('factors_json','TEXT'),
+            ('effective_sl','REAL'),
+            ('pending_multipliers_json','TEXT'),
+            ('trade_type','TEXT'),
+            ('realized_r','REAL'),
+            ('intrabar_ambiguous','INTEGER DEFAULT 0'),
+            ('entry_fill_time','TEXT'),
+        ]:
+            try:
+                con.execute(f'ALTER TABLE trades ADD COLUMN {col} {typ}')
+            except sqlite3.OperationalError:
+                pass
+        con.commit()
+        con.close()
+
+# ---------------- Structure detectors ----------------
+def _structure_bias(c, window=3):
+    highs, lows = swing_levels(c, window)
+    if len(highs) >= 2 and len(lows) >= 2:
+        hh = highs[-1][1] > highs[-2][1]
+        hl = lows[-1][1] > lows[-2][1]
+        lh = highs[-1][1] < highs[-2][1]
+        ll = lows[-1][1] < lows[-2][1]
+        if hh and hl:
+            return 'BULLISH'
+        if lh and ll:
+            return 'BEARISH'
+    return 'NEUTRAL'
+
+def _recent_sweep(c, swings, side, freshness=3):
+    if len(c) < 3 or not swings:
+        return False, None
+    # Only confirmed swings are liquidity references.
+    refs = swings[-5:]
+    recent = c[-freshness:]
+    for _, level in reversed(refs):
+        if side == 'LOW':
+            if min(x['low'] for x in recent) < level and c[-1]['close'] > level:
+                return True, level
+        else:
+            if max(x['high'] for x in recent) > level and c[-1]['close'] < level:
+                return True, level
+    return False, None
+
+def _break_structure(c, highs, lows, structure_bias):
+    out = {'bull_bos':False,'bear_bos':False,'bull_mss':False,'bear_mss':False}
+    recent = c[-2:] if len(c) >= 2 else c
+    if highs and structure_bias == 'BULLISH':
+        out['bull_bos'] = any(x['close'] > highs[-1][1] for x in recent)
+    if lows and structure_bias == 'BEARISH':
+        out['bear_bos'] = any(x['close'] < lows[-1][1] for x in recent)
+    if highs and structure_bias == 'BEARISH':
+        out['bull_mss'] = any(x['close'] > highs[-1][1] for x in recent)
+    if lows and structure_bias == 'BULLISH':
+        out['bear_mss'] = any(x['close'] < lows[-1][1] for x in recent)
+    return out
+
+def analyze_tf(c):
+    closes=[x['close'] for x in c]
+    vols=[x['volume'] for x in c]
+    e20=ema(closes,20); e50=ema(closes,50)
+    e200=ema(closes,200) if len(closes)>=200 else None
+    r=rsi(closes); a=atr(c); last=c[-1]
+    highs,lows=swing_levels(c,3)
+    sb=_structure_bias(c,3)
+    ema_bull=e20>e50 and last['close']>e20 and slope(closes,5)>0
+    ema_bear=e20<e50 and last['close']<e20 and slope(closes,5)<0
+    bias=sb if sb!='NEUTRAL' else ('BULLISH' if ema_bull else 'BEARISH' if ema_bear else 'NEUTRAL')
+    bull_sweep,bull_level=_recent_sweep(c,lows,'LOW')
+    bear_sweep,bear_level=_recent_sweep(c,highs,'HIGH')
+    br=_break_structure(c,highs,lows,sb)
+    avgvol=sum(vols[-20:])/max(1,min(20,len(vols)))
+    vr=last['volume']/avgvol if avgvol else 1.0
+    rh=max(x['high'] for x in c[-30:]); rl=min(x['low'] for x in c[-30:])
+    return {
+        'bias':bias,'structure_bias':sb,'ema20':e20,'ema50':e50,'ema200':e200,
+        'rsi':r,'atr':a,'volume_ratio':vr,
+        'bull_sweep':bull_sweep,'bear_sweep':bear_sweep,
+        'bull_sweep_level':bull_level,'bear_sweep_level':bear_level,
+        'bull_bos':br['bull_bos'],'bear_bos':br['bear_bos'],
+        'bull_mss':br['bull_mss'],'bear_mss':br['bear_mss'],
+        'bull_mom':52<=r<=72,'bear_mom':28<=r<=48,
+        'high':rh,'low':rl,'price':last['close'],
+        'range':max(1e-12,rh-rl),'swing_highs':highs,'swing_lows':lows
+    }
+
+def detect_choch(c, bias=None, window=3):
+    sb=_structure_bias(c,window)
+    highs,lows=swing_levels(c,window)
+    recent=c[-2:]
+    return {
+        'bull_choch': bool(sb=='BEARISH' and highs and any(x['close']>highs[-1][1] for x in recent)),
+        'bear_choch': bool(sb=='BULLISH' and lows and any(x['close']<lows[-1][1] for x in recent))
+    }
+
+def detect_fvg(c, direction, lookback=15):
+    if len(c)<3:
+        return None
+    aatr=atr(c) or 1e-12
+    start=max(2,len(c)-lookback)
+    for i in range(len(c)-1,start-1,-1):
+        left,disp,right=c[i-2],c[i-1],c[i]
+        body=abs(disp['close']-disp['open'])
+        if body < max(aatr*OB_MIN_DISPLACEMENT_ATR, 1e-12):
+            continue
+        if direction=='LONG' and left['high'] < right['low'] and disp['close']>disp['open']:
+            low,high=left['high'],right['low']
+            if (high-low)/aatr < FVG_MIN_ATR:
+                continue
+            # Reject if >50% of the gap was subsequently filled.
+            if any(x['low'] <= low+(high-low)*0.5 for x in c[i+1:]):
+                continue
+            return {'low':low,'high':high,'type':'bullish_fvg','fresh':True,'index':i}
+        if direction=='SHORT' and left['low'] > right['high'] and disp['close']<disp['open']:
+            low,high=right['high'],left['low']
+            if (high-low)/aatr < FVG_MIN_ATR:
+                continue
+            if any(x['high'] >= high-(high-low)*0.5 for x in c[i+1:]):
+                continue
+            return {'low':low,'high':high,'type':'bearish_fvg','fresh':True,'index':i}
+    return None
+
+def detect_zone(c, direction):
+    if len(c)<8:
+        return None
+    aatr=atr(c) or 1e-12
+    highs,lows=swing_levels(c,3)
+    # Search from newest backwards for a fresh opposing candle followed by
+    # meaningful displacement AND a confirmed structure break.
+    for i in range(len(c)-3,max(1,len(c)-24),-1):
+        ob=c[i]
+        if direction=='LONG' and ob['close']>=ob['open']:
+            continue
+        if direction=='SHORT' and ob['close']<=ob['open']:
+            continue
+        nxt=c[i+1:min(len(c),i+4)]
+        impulse=max(nxt,key=lambda x:abs(x['close']-x['open']))
+        body=abs(impulse['close']-impulse['open'])
+        if body < aatr*OB_MIN_DISPLACEMENT_ATR:
+            continue
+        if direction=='LONG':
+            broken=bool(highs and any(x['close']>highs[-1][1] for x in nxt))
+        else:
+            broken=bool(lows and any(x['close']<lows[-1][1] for x in nxt))
+        if not broken:
+            continue
+        low,high=ob['low'],ob['high']
+        depth=max(1e-12,high-low)
+        future=c[i+1:]
+        # 50% mitigation threshold; a wick through only the edge does not
+        # automatically consume the whole block.
+        if direction=='LONG' and any(x['low']<=low+depth*0.5 for x in future):
+            continue
+        if direction=='SHORT' and any(x['high']>=high-depth*0.5 for x in future):
+            continue
+        return {'low':low,'high':high,'type':'bullish_ob' if direction=='LONG' else 'bearish_ob',
+                'fresh':True,'index':i}
+    return None
+
+def tbs_crt_bonus(candles, direction):
+    # CRT and TBS are both manifestations of the same range/sweep family:
+    # award one grouped confirmation, never +8 for the same event.
+    hits=[]
+    for detector in (detect_crt,detect_tbs):
+        ok,reason=detector(candles)
+        if ok:
+            bullish='bullish' in reason.lower()
+            if (direction=='LONG' and bullish) or (direction=='SHORT' and not bullish):
+                hits.append(reason)
+    return (4 if hits else 0), hits[:1]
+
+# ---------------- Trade construction ----------------
+def _liquidity_targets(tf, direction, entry, risk):
+    if direction=='LONG':
+        levels=sorted({p for _,p in tf.get('swing_highs',[]) if p>entry})
+        return [p for p in levels if p-entry >= risk]
+    levels=sorted({p for _,p in tf.get('swing_lows',[]) if p<entry}, reverse=True)
+    return [p for p in levels if entry-p >= risk]
+
+def _choose_targets(tf1,tf2,direction,entry,risk):
+    levels=_liquidity_targets(tf1,direction,entry,risk)+_liquidity_targets(tf2,direction,entry,risk)
+    if direction=='LONG':
+        levels=sorted(set(x for x in levels if x>entry))
+    else:
+        levels=sorted(set(x for x in levels if x<entry),reverse=True)
+    def fb(r): return entry+r*risk if direction=='LONG' else entry-r*risk
+    # TP1/TP2/TP3 are structural first. If structure has no suitable target,
+    # fallback is a minimum-R target, not a "score -> 5R" rule.
+    tp1=next((x for x in levels if abs(x-entry)>=1.0*risk),fb(1.0))
+    tp2=next((x for x in levels if abs(x-entry)>=2.0*risk),fb(2.0))
+    tp3=next((x for x in levels if abs(x-entry)>=3.0*risk),fb(3.0))
+    if direction=='LONG':
+        tp1=max(tp1,entry+1.0*risk); tp2=max(tp2,tp1+0.5*risk); tp3=max(tp3,tp2+0.5*risk)
+    else:
+        tp1=min(tp1,entry-1.0*risk); tp2=min(tp2,tp1-0.5*risk); tp3=min(tp3,tp2-0.5*risk)
+    return tp1,tp2,tp3
+
+def build_analysis(symbol):
+    # One market-data snapshot only; all detectors consume the same candles.
+    a=_build_analysis_legacy(symbol)
+    tf1,tf2,tf3=TIMEFRAMES
+    c1=a['candles'][tf1]; c2=a['candles'][tf2]; c3=a['candles'][tf3]
+    a1,a2,a3=analyze_tf(c1),analyze_tf(c2),analyze_tf(c3)
+
+    scores={'LONG':0.0,'SHORT':0.0}
+    reasons={'LONG':[],'SHORT':[]}
+    flags_by_dir={}
+    for d in ('LONG','SHORT'):
+        htf_ok=(a1['structure_bias']=='BULLISH' and d=='LONG') or (a1['structure_bias']=='BEARISH' and d=='SHORT')
+        ema_ok=(a1.get('ema200') is None or (d=='LONG' and a1['price']>a1['ema200']) or (d=='SHORT' and a1['price']<a1['ema200']))
+        trend_ok=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)>=1.0
+
+        zone=detect_zone(c2,d)
+        fvg=detect_fvg(c2,d)
+        in_ob=bool(zone and zone['low']<=a3['price']<=zone['high'])
+        in_fvg=bool(fvg and fvg['low']<=a3['price']<=fvg['high'])
+        in_poi=in_ob or in_fvg
+
+        sweep=a3['bull_sweep'] if d=='LONG' else a3['bear_sweep']
+        bos=a3['bull_bos'] if d=='LONG' else a3['bear_bos']
+        choch=(detect_choch(c3,a3['bias'])['bull_choch'] if d=='LONG' else detect_choch(c3,a3['bias'])['bear_choch'])
+        crt_bonus,_=tbs_crt_bonus(c3,d)
+        mom=(a3['bull_mom'] if d=='LONG' else a3['bear_mom'])
+        vol=a3['volume_ratio']>=1.1
+        pbonus=build_pattern_score(detect_candlestick_patterns(c3),d)
+
+        # Grouped scoring: trend/EMA are one regime group; sweep+BOS are
+        # separate trigger evidence; CRT/TBS one group; candle pattern is a
+        # tiebreaker only.
+        if htf_ok: scores[d]+=20; reasons[d].append('HTF structural bias aligned')
+        if trend_ok and ema_ok: scores[d]+=15; reasons[d].append('trend regime aligned')
+        if in_poi: scores[d]+=18; reasons[d].append('fresh 15M POI reached')
+        if sweep: scores[d]+=12; reasons[d].append('confirmed 5M liquidity sweep')
+        if bos: scores[d]+=12; reasons[d].append('confirmed 5M BOS')
+        if choch: scores[d]+=5; reasons[d].append('5M CHOCH/MSS')
+        if crt_bonus: scores[d]+=4; reasons[d].append('CRT/TBS confirmation')
+        if mom and vol: scores[d]+=5; reasons[d].append('momentum + volume confirmation')
+        if pbonus>0: scores[d]+=2; reasons[d].append('supportive candle pattern')
+
+        flags_by_dir[d]={
+            'htf_bias':htf_ok and ema_ok,
+            'trend_regime':trend_ok,
+            'liquidity_sweep':bool(sweep),
+            'bos':bool(bos),
+            'order_block':bool(in_ob),
+            'choch':bool(choch),
+            'fvg':bool(in_fvg),
+            'crt':bool(crt_bonus),
+            'tbs':bool(crt_bonus),
+            'candle_pattern':bool(pbonus>0),
+            'volume_expansion':bool(vol),
+            'momentum':bool(mom),
+            'eqh_eql_pool':False,
+        }
+
+    # Never silently pick LONG on a tie/near-tie.
+    if abs(scores['LONG']-scores['SHORT']) < MIN_DIRECTION_GAP:
+        direction=None
+    else:
+        direction='LONG' if scores['LONG']>scores['SHORT'] else 'SHORT'
+
+    if direction is None:
+        best_score=0.0
+        reasons_best=['LONG/SHORT score gap below minimum direction threshold']
+        entry=a3['price']
+        atrv=a3['atr'] or entry*0.005
+        sl=entry-atrv if scores['LONG']>=scores['SHORT'] else entry+atrv
+        tp1=entry+atrv if scores['LONG']>=scores['SHORT'] else entry-atrv
+        tp2=entry+2*atrv if scores['LONG']>=scores['SHORT'] else entry-2*atrv
+        tp3=entry+3*atrv if scores['LONG']>=scores['SHORT'] else entry-3*atrv
+        flags={}
+        hard_htf=False; hard_trend=False
+    else:
+        best_score=min(100.0,scores[direction])
+        reasons_best=reasons[direction]
+        hard_htf=flags_by_dir[direction]['htf_bias']
+        hard_trend=flags_by_dir[direction]['trend_regime']
+        entry=a3['price']
+        atrv=a3['atr'] or entry*0.005
+        sweep_level=a3.get('bull_sweep_level') if direction=='LONG' else a3.get('bear_sweep_level')
+        swings=a3.get('swing_lows' if direction=='LONG' else 'swing_highs') or []
+        structural=sweep_level or (swings[-1][1] if swings else (entry-atrv if direction=='LONG' else entry+atrv))
+        if direction=='LONG':
+            sl=min(structural-0.25*atrv,entry-0.60*atrv)
+        else:
+            sl=max(structural+0.25*atrv,entry+0.60*atrv)
+        risk=abs(entry-sl)
+        tp1,tp2,tp3=_choose_targets(a1,a2,direction,entry,risk)
+        flags=flags_by_dir[direction]
+
+    a.update({
+        'direction':direction or 'NONE',
+        'score':round(best_score,2),
+        'entry':entry,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,
+        'rr':abs(tp3-entry)/max(abs(entry-sl),1e-12),
+        'reasons':reasons_best,
+        'factor_flags':flags,
+        'htf_bias_ok':bool(hard_htf),
+        'trend_regime_ok':bool(hard_trend),
+        'zone_entry':None,
+    })
+    return a
+
+# ---------------- Independent Gemini validation ----------------
+def gemini_validate(analysis):
+    # Deliberately DO NOT send quant score/reasons/levels. This removes the
+    # strongest anchoring source and makes the second model a real second read.
+    prompt={
+        'task':'Independently analyze the raw OHLCV and return a trade decision. Do not infer missing structure.',
+        'symbol':analysis['symbol'],
+        'framework':analysis['framework'],
+        'timeframes':analysis['timeframes'],
+        'raw_ohlcv_candles':analysis.get('candles',{}),
+        'timeframe_analysis':{
+            k:{
+                x:(_round_price(v) if x in ('ema20','ema50','ema200','atr','price')
+                   else (round(v,2) if x in ('rsi','volume_ratio') else v))
+                for x,v in av.items()
+                if x not in ('high','low','range','swing_highs','swing_lows')
+            } for k,av in analysis['tf'].items()
+        }
+    }
+    system="""You are an independent second analyst for a crypto trading research bot.
+Use ONLY the supplied raw OHLCV candles and derived neutral market data.
+Do NOT receive or use a quant score, quant direction, quant Entry/SL/TP, or quant reasons.
+Check directly: HTF structural bias, trend, liquidity sweep, BOS, CHOCH/MSS,
+15M order block/FVG, volume/momentum, CRT/TBS, and candle pattern.
+Approve ONLY when the setup has a clear directional thesis, a real confirmed
+structure event, a sensible entry, an invalidation stop, and TP1/TP2/TP3 with
+TP2 at least 2R. If evidence is incomplete, REJECT.
+Return ONLY JSON:
+{
+ "decision":"APPROVE|REJECT",
+ "direction":"LONG|SHORT",
+ "score":0-100,
+ "confidence":0-100,
+ "entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,
+ "bos_detected":true/false,"choch_detected":true/false,
+ "order_block_detected":true/false,"fvg_detected":true/false,
+ "crt_detected":true/false,"tbs_detected":true/false,
+ "reason":"brief evidence-based reason"
+}"""
+    return gemini_json(system,prompt,max_output_tokens=1800)
+
+def structure_agreement(quant_flags, ai):
+    pairs=[('bos','bos_detected'),('choch','choch_detected'),
+           ('order_block','order_block_detected'),('fvg','fvg_detected'),
+           ('crt','crt_detected'),('tbs','tbs_detected')]
+    positive=0; disagree=0; checked=0
+    for q,g in pairs:
+        if ai.get(g) is None:
+            continue
+        checked+=1
+        qv=bool(quant_flags.get(q)); gv=bool(ai.get(g))
+        if qv and gv:
+            positive+=1
+        elif qv != gv:
+            disagree+=1
+    ratio=positive/max(1,positive+disagree)
+    return positive,checked,ratio
+
+def _final_level_check(direction, entry, sl, tp1, tp2, tp3):
+    vals=[entry,sl,tp1,tp2,tp3]
+    if any(v is None for v in vals):
+        return False,'Missing trade level'
+    entry,sl,tp1,tp2,tp3=map(float,vals)
+    if direction=='LONG':
+        if not (sl<entry<tp1<=tp2<=tp3):
+            return False,'Invalid LONG level ordering'
+    elif direction=='SHORT':
+        if not (sl>entry>tp1>=tp2>=tp3):
+            return False,'Invalid SHORT level ordering'
+    else:
+        return False,'Invalid direction'
+    risk=abs(entry-sl)
+    if risk<=0 or abs(tp2-entry)/risk<2.0:
+        return False,'TP2 R:R below 1:2'
+    return True,'OK'
+
+# ---------------- Watch-state / scan execution ----------------
+def scan_once(force=False):
+    global LAST_SCAN,LAST_ERROR
+    if not scanner_is_active() and not force:
+        return {'status':'stopped'}
+    if not SCAN_LOCK.acquire(blocking=False):
+        return {'status':'already_running'}
+    result={'time':now_utc(),'symbols':{},'best':None}
+    analyses=[]; scan_errors=[]
+    try:
+        for symbol in WATCHLIST:
+            try:
+                a=build_analysis(symbol)
+                analyses.append(a)
+                result['symbols'][symbol]={'score':a['score'],'decision':'RANKED'}
+            except Exception as e:
+                err=f'{type(e).__name__}: {e}'
+                LAST_ERROR=f'{symbol}: {err}'
+                log.exception('score %s',symbol)
+                result['symbols'][symbol]={'error':str(e),'decision':'SCAN_ERROR'}
+                scan_errors.append((symbol,err))
+            time.sleep(1)
+
+        # Hard filters BEFORE watch state. No candidate can enter the state
+        # machine unless the HTF structure and trend regime are valid.
+        eligible=[a for a in analyses if a.get('direction') in ('LONG','SHORT')
+                  and a.get('htf_bias_ok') and a.get('trend_regime_ok')]
+
+        watch_notes={}
+        triggered=[]
+        if WATCH_STATE_ENABLED:
+            for a in eligible:
+                status,note=update_watch_state(a)
+                watch_notes[a['symbol']]=(status,note)
+                if status=='TRIGGERED':
+                    triggered.append(a)
+        else:
+            triggered=list(eligible)
+
+        candidates=triggered
+        candidates.sort(key=lambda x:float(x.get('score',0)),reverse=True)
+
+        # Persist a complete scan log, including hard-filter failures.
+        with DB_LOCK:
+            con=db(); now=now_utc()
+            for a in analyses:
+                if a not in eligible:
+                    missing=[]
+                    if not a.get('direction') in ('LONG','SHORT'):
+                        missing.append('direction')
+                    if not a.get('htf_bias_ok'):
+                        missing.append('htf_bias')
+                    if not a.get('trend_regime_ok'):
+                        missing.append('trend_regime')
+                    decision='HARD_FILTER_FAIL'
+                    reason='Failed: '+', '.join(missing)
+                else:
+                    status,note=watch_notes.get(a['symbol'],('ELIGIBLE','eligible'))
+                    decision=f'WATCHING_{status}' if WATCH_STATE_ENABLED else 'ELIGIBLE'
+                    reason=note
+                con.execute(
+                    'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
+                    (now,a['symbol'],a['score'],decision,0,reason[:500])
+                )
+            con.commit(); con.close()
+
+        if not candidates:
+            return result
+
+        # Try the best N candidates. If #1 is rejected, #2 gets a fair chance.
+        for rank,best in enumerate(candidates[:MAX_GEMINI_CANDIDATES],1):
+            best_symbol=best['symbol']; best_score=float(best['score'])
+            if best_score < MIN_SCORE:
+                continue
+            if has_open_similar(best_symbol,best['direction']) or has_recent_loss(best_symbol):
+                continue
+
+            try:
+                ai=gemini_validate(best)
+            except Exception as exc:
+                reason=f'Gemini error: {type(exc).__name__}: {exc}'
+                with DB_LOCK:
+                    con=db()
+                    con.execute(
+                        'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
+                        (now_utc(),best_symbol,best_score,'GEMINI_ERROR',1,reason)
+                    )
+                    con.commit(); con.close()
+                continue
+
+            try:
+                gemini_score=float(ai.get('score',ai.get('confidence',0)) or 0)
+            except (TypeError,ValueError):
+                gemini_score=0.0
+
+            approved=False; trade_plan=None
+            reason=ai.get('reason','Gemini rejected')
+            if str(ai.get('decision','REJECT')).upper()=='APPROVE' and gemini_score>=GEMINI_MIN_SCORE:
+                positive,checked,agreement=structure_agreement(best.get('factor_flags',{}),ai)
+                g_direction=str(ai.get('direction') or '').upper()
+                if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
+                    reason='Gemini direction disagrees with quant direction'
+                elif checked>=3 and (positive<MIN_STRUCTURE_AGREEMENTS or agreement<MAX_STRUCTURE_DISAGREEMENT):
+                    reason=(f'Insufficient positive structure agreement: '
+                            f'{positive} positive / {checked} checked, ratio={agreement:.2f}')
+                else:
+                    try:
+                        vals=[float(ai[k]) for k in ('entry','sl','tp1','tp2','tp3')]
+                        g_entry,g_sl,g_tp1,g_tp2,g_tp3=vals
+                    except (KeyError,TypeError,ValueError):
+                        reason='Gemini approval missing valid trade levels'
+                    else:
+                        ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
+                        if ok:
+                            trade_plan=dict(best)
+                            trade_plan.update({
+                                'direction':g_direction,'entry':g_entry,'sl':g_sl,
+                                'tp1':g_tp1,'tp2':g_tp2,'tp3':g_tp3,
+                                'rr':abs(g_tp2-g_entry)/max(abs(g_entry-g_sl),1e-12)
+                            })
+                            approved=True
+                            reason=ai.get('reason',why)
+                        else:
+                            reason=why
+
+            decision='APPROVED' if approved else 'REJECTED'
+            with DB_LOCK:
+                con=db()
+                con.execute(
+                    'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
+                    (now_utc(),best_symbol,best_score,decision,1,
+                     f'[candidate {rank}/{min(MAX_GEMINI_CANDIDATES,len(candidates))}] '
+                     f'[Gemini {gemini_score:.0f}] {reason}')
+                )
+                con.commit(); con.close()
+
+            result['symbols'][best_symbol].update({
+                'decision':decision,'gemini':True,'ai':ai,
+                'gemini_score':gemini_score,'reason':reason
+            })
+
+            if approved:
+                tid=insert_trade(trade_plan,ai)
+                result['best']={'symbol':best_symbol,'score':best_score,'trade_id':tid}
+                telegram_send(
+                    build_signal_card(trade_plan,ai,best,best_score,gemini_score),
+                    parse_mode=None
+                )
+                return result
+
+        return result
+    finally:
+        LAST_SCAN=now_utc()
+        SCAN_LOCK.release()
+
+# ---------------- Trade execution/tracking ----------------
+def insert_trade(a,ai):
+    tid=_insert_trade_legacy(a,ai)
+    with DB_LOCK:
+        con=db()
+        con.execute(
+            "UPDATE trades SET trade_type='MARKET_GEMINI', factors_json=? WHERE id=?",
+            (json.dumps({'quant':a.get('factor_flags',{}),
+                         'gemini':{k:ai.get(k) for k in (
+                             'bos_detected','choch_detected','order_block_detected',
+                             'fvg_detected','crt_detected','tbs_detected')},
+                         'quant_score':a.get('score'),
+                         'gemini_score':ai.get('score',ai.get('confidence'))}),tid)
+        )
+        con.commit(); con.close()
+    return tid
+
+def insert_pending_limit(a):
+    # Separate experimental path. It is OFF by default and is NEVER included
+    # in MARKET_GEMINI factor statistics.
+    if not ENABLE_PENDING_LIMITS:
+        return None
+    tid=_insert_pending_limit_legacy(a)
+    with DB_LOCK:
+        con=db()
+        con.execute("UPDATE trades SET trade_type='LIMIT_QUANT' WHERE id=?",(tid,))
+        con.commit(); con.close()
+    return tid
+
+def track_pending_limits():
+    if not ENABLE_PENDING_LIMITS:
+        return
+    with DB_LOCK:
+        con=db(); rows=con.execute("SELECT * FROM trades WHERE status='PENDING_LIMIT'").fetchall(); con.close()
+    for row in rows:
+        try:
+            if PENDING_LIMIT_TIMEOUT_MIN>0:
+                age=_minutes_since(row['created_at'])
+                if age is not None and age>PENDING_LIMIT_TIMEOUT_MIN:
+                    with DB_LOCK:
+                        con=db(); con.execute(
+                            "UPDATE trades SET status='CLOSED',final_result='EXPIRED_NO_ENTRY',close_time=? WHERE id=?",
+                            (now_utc(),row['id'])
+                        ); con.commit(); con.close()
+                    continue
+            candles=fetch_tracking_candle(row['symbol'],6)
+            if not candles:
+                continue
+            c=candles[-1]; entry=float(row['entry'])
+            # Full candle range, not one-sided touch.
+            filled=c['low']<=entry<=c['high']
+            if not filled:
+                continue
+
+            atr_c=fetch_klines(row['symbol'],TRACK_TIMEFRAME,30)
+            a_atr=atr(atr_c) if atr_c else abs(entry-row['sl'])*0.3
+            try:
+                mult=json.loads(row['pending_multipliers_json'] or '{}')
+            except Exception:
+                mult={}
+            m1,m2,m3=mult.get('tp1',1.5),mult.get('tp2',2.3),mult.get('tp3',3.2)
+            direction=row['direction']
+            if direction=='LONG':
+                sweep=min(x['low'] for x in candles[-3:])
+                new_sl=min(sweep-0.3*a_atr,entry-0.6*a_atr)
+                risk=entry-new_sl
+                tps=(entry+m1*risk,entry+m2*risk,entry+m3*risk)
+            else:
+                sweep=max(x['high'] for x in candles[-3:])
+                new_sl=max(sweep+0.3*a_atr,entry+0.6*a_atr)
+                risk=new_sl-entry
+                tps=(entry-m1*risk,entry-m2*risk,entry-m3*risk)
+
+            # Fill is real now: OPEN, not WAITING_ENTRY. Process the same candle
+            # using the conservative intrabar policy.
+            pseudo=dict(row)
+            pseudo.update({
+                'status':'OPEN','entry':entry,'sl':new_sl,'effective_sl':new_sl,
+                'tp1':tps[0],'tp2':tps[1],'tp3':tps[2],'highest_tp':0
+            })
+            u=check_trade(pseudo,c)
+            if u is None:
+                u={'status':'OPEN','effective_sl':new_sl,'entry_time':now_utc(),
+                   'entry_fill_time':now_utc()}
+            else:
+                u.setdefault('entry_time',now_utc())
+                u['entry_fill_time']=now_utc()
+
+            with DB_LOCK:
+                con=db()
+                sets={'sl':new_sl,'effective_sl':u.get('effective_sl',new_sl),
+                      'tp1':tps[0],'tp2':tps[1],'tp3':tps[2],
+                      'status':u.get('status','OPEN'),'entry_time':u.get('entry_time',now_utc()),
+                      'entry_fill_time':now_utc(),'ai_reason':'Experimental limit filled; same candle processed'}
+                sets.update({k:v for k,v in u.items() if k in (
+                    'highest_tp','tp1_hit','tp2_hit','tp3_hit','sl_hit','final_result',
+                    'close_time','intrabar_ambiguous','realized_r')})
+                sql=', '.join(f'{k}=?' for k in sets)
+                con.execute(f'UPDATE trades SET {sql} WHERE id=?',list(sets.values())+[row['id']])
+                con.commit(); con.close()
+        except Exception as e:
+            log.warning('pending-limit tracker %s: %s',row['symbol'],e)
+
+def _compute_realized_r(direction,entry,sl,tp3,eff_sl,result):
+    risk=abs(entry-sl)
+    if risk<=0:
+        return None
+    if result=='TP3_WIN':
+        return abs(tp3-entry)/risk
+    if result and 'LOCKED_SL' in result:
+        return ((eff_sl-entry)/risk if direction=='LONG' else (entry-eff_sl)/risk)
+    if result=='SL_LOSS':
+        return -1.0
+    return None
+
+def check_trade(row,candle):
+    direction=row['direction']; high=float(candle['high']); low=float(candle['low'])
+    entry=float(row['entry']); status=row['status']; htp=int(row['highest_tp'] or 0)
+    eff_sl=float(row['effective_sl'] if row['effective_sl'] is not None else row['sl'])
+    just_entered=False
+    if status=='WAITING_ENTRY':
+        if not (low<=entry<=high):
+            return None
+        status='OPEN'; just_entered=True
+    pre_sl_hit=(low<=eff_sl) if direction=='LONG' else (high>=eff_sl)
+    tp_hits=[]
+    for n,key in ((1,'tp1'),(2,'tp2'),(3,'tp3')):
+        if row[key] is not None:
+            hit=(high>=float(row[key])) if direction=='LONG' else (low<=float(row[key]))
+            if hit: tp_hits.append(n)
+    ambiguous=bool(pre_sl_hit and tp_hits)
+
+    # OHLC cannot reveal intrabar order. Conservative is default; optimistic is
+    # available for research, but the live bot should stay conservative.
+    if ambiguous and INTRABAR_POLICY=='unknown':
+        return {
+            'status':'CLOSED','sl_hit':1,'effective_sl':eff_sl,
+            'final_result':'INTRABAR_UNKNOWN','close_time':now_utc(),
+            'intrabar_ambiguous':1,'entry_time':now_utc() if just_entered else row['entry_time']
+        }
+
+    if pre_sl_hit and INTRABAR_POLICY!='optimistic':
+        result='SL_LOSS' if htp==0 else f'TP{htp}_LOCKED_SL'
+        realized=_compute_realized_r(direction,entry,float(row['sl']),float(row['tp3']),eff_sl,result)
+        return {
+            'status':'CLOSED','sl_hit':1,'effective_sl':eff_sl,'final_result':result,
+            'close_time':now_utc(),'intrabar_ambiguous':int(ambiguous),'realized_r':realized,
+            'highest_tp':max([htp]+tp_hits) if tp_hits else htp,
+            'tp1_hit':int(max([htp]+tp_hits)>=1),'tp2_hit':int(max([htp]+tp_hits)>=2),
+            'tp3_hit':int(max([htp]+tp_hits)>=3),
+            'entry_time':now_utc() if just_entered else row['entry_time']
+        }
+
+    new_htp=max([htp]+tp_hits) if tp_hits else htp
+    new_eff=eff_sl
+    if new_htp>=1:
+        new_eff=max(new_eff,entry) if direction=='LONG' else min(new_eff,entry)
+    if new_htp>=2:
+        tp1=float(row['tp1'])
+        new_eff=max(new_eff,tp1) if direction=='LONG' else min(new_eff,tp1)
+
+    out={
+        'status':'OPEN','highest_tp':new_htp,
+        'tp1_hit':int(new_htp>=1),'tp2_hit':int(new_htp>=2),'tp3_hit':int(new_htp>=3),
+        'effective_sl':new_eff,'intrabar_ambiguous':int(ambiguous),
+        'last_checked':now_utc()
+    }
+    if just_entered:
+        out['entry_time']=now_utc()
+        out['entry_fill_time']=now_utc()
+    if new_htp>=3:
+        result='TP3_WIN'
+        out.update({
+            'status':'CLOSED','final_result':result,'close_time':now_utc(),
+            'realized_r':_compute_realized_r(direction,entry,float(row['sl']),float(row['tp3']),new_eff,result)
+        })
+    return out
+
+# ---------------- Metrics / forward factor report ----------------
+FACTOR_KEYS=['htf_bias','trend_regime','liquidity_sweep','bos','order_block','choch',
+             'fvg','crt','tbs','candle_pattern','volume_expansion','momentum','eqh_eql_pool']
+
+def _trade_r_multiple(row):
+    if row.get('realized_r') is not None:
+        try: return float(row['realized_r'])
+        except Exception: pass
+    return _compute_realized_r(
+        row.get('direction'),float(row.get('entry')),float(row.get('sl')),
+        float(row.get('tp3')),float(row.get('effective_sl') if row.get('effective_sl') is not None else row.get('sl')),
+        row.get('final_result')
+    )
+
+def _group_stats(rows):
+    n=len(rows)
+    if not n:
+        return {'trades':0,'tp3_win_rate':None,'tp1_rate':None,'positive_rate':None,'avg_r':None,'median_r':None}
+    rvals=[x for x in (_trade_r_multiple(r) for r in rows) if x is not None]
+    wins=sum(1 for r in rows if r.get('final_result')=='TP3_WIN')
+    tp1=sum(1 for r in rows if r.get('tp1_hit'))
+    positive=sum(1 for r in rows if (r.get('realized_r') is not None and float(r.get('realized_r'))>0) or r.get('final_result')=='TP3_WIN')
+    rvals_sorted=sorted(rvals)
+    med=None if not rvals_sorted else (rvals_sorted[len(rvals_sorted)//2] if len(rvals_sorted)%2 else (rvals_sorted[len(rvals_sorted)//2-1]+rvals_sorted[len(rvals_sorted)//2])/2)
+    return {
+        'trades':n,
+        'tp3_win_rate':round(wins/n*100,1),
+        'tp1_rate':round(tp1/n*100,1),
+        'positive_rate':round(positive/n*100,1),
+        'avg_r':round(sum(rvals)/len(rvals),3) if rvals else None,
+        'median_r':round(med,3) if med is not None else None
+    }
+
+def stats():
+    with DB_LOCK:
+        con=db()
+        rows=[dict(x) for x in con.execute("SELECT * FROM trades").fetchall()]
+        con.close()
+    closed=[r for r in rows if r['status']=='CLOSED' and r.get('final_result')!='EXPIRED_NO_ENTRY']
+    market=[r for r in closed if (r.get('trade_type') or 'MARKET_GEMINI')=='MARKET_GEMINI']
+    limit=[r for r in closed if r.get('trade_type')=='LIMIT_QUANT']
+    g=_group_stats(market)
+    allg=_group_stats(closed)
+    return {
+        'total':len(rows),
+        'open':sum(r['status'] in ('WAITING_ENTRY','OPEN') for r in rows),
+        'pending':sum(r['status']=='PENDING_LIMIT' for r in rows),
+        'expired':sum(r.get('final_result')=='EXPIRED_NO_ENTRY' for r in rows),
+        'closed':len(closed),
+        'wins':sum(r.get('final_result')=='TP3_WIN' for r in closed),
+        'losses':sum(r.get('final_result')=='SL_LOSS' for r in closed),
+        'partials':sum(bool(str(r.get('final_result') or '').startswith('TP') and r.get('final_result')!='TP3_WIN') for r in closed),
+        'win_rate':g['tp3_win_rate'] or 0,
+        'tp1_rate':g['tp1_rate'] or 0,
+        'positive_rate':g['positive_rate'] or 0,
+        'expectancy_r':g['avg_r'],
+        'market_gemini':g,
+        'limit_quant':_group_stats(limit),
+        'combined':allg,
+    }
+
+def factor_backtest_report(min_sample=FACTOR_MIN_SAMPLE):
+    # This is deliberately named/report-labeled as an OBSERVATIONAL FORWARD
+    # report. It does not claim to be a historical backtest and never changes
+    # scoring weights automatically.
+    min_sample=max(FACTOR_MIN_SAMPLE,int(min_sample))
+    with DB_LOCK:
+        con=db()
+        rows=[dict(x) for x in con.execute(
+            "SELECT * FROM trades WHERE status='CLOSED' AND final_result NOT IN ('EXPIRED_NO_ENTRY','INTRABAR_UNKNOWN') "
+            "AND factors_json IS NOT NULL AND factors_json!=''"
+        ).fetchall()]
+        con.close()
+    report={'type':'forward_factor_observation','total_closed_with_factors':len(rows),
+            'min_sample_per_side':min_sample,'auto_weighting':False,'factors':{}}
+    if not rows:
+        report['note']='No closed trades with factor tags yet.'
+        return report
+
+    for key in FACTOR_KEYS:
+        wf=[]; wo=[]
+        for r in rows:
+            try: flags=(json.loads(r['factors_json']) or {}).get('quant',{})
+            except Exception: flags={}
+            (wf if flags.get(key) else wo).append(r)
+        a=_group_stats(wf); b=_group_stats(wo)
+        reliable=a['trades']>=min_sample and b['trades']>=min_sample
+        report['factors'][key]={
+            'with_factor':a,'without_factor':b,
+            'edge_tp3_win_rate_pts':round(a['tp3_win_rate']-b['tp3_win_rate'],1)
+                if a['tp3_win_rate'] is not None and b['tp3_win_rate'] is not None else None,
+            'edge_avg_r':round(a['avg_r']-b['avg_r'],3)
+                if a['avg_r'] is not None and b['avg_r'] is not None else None,
+            'reliable_sample':reliable,
+            'warning':None if reliable else f'low sample: need >= {min_sample} trades in BOTH groups'
+        }
+    return report
+
+# ---------------- Historical research backtest ----------------
+def _resample_5m(c5, minutes):
+    step=max(1,minutes//5)
+    out=[]
+    for i in range(0,len(c5)-step+1,step):
+        g=c5[i:i+step]
+        out.append({
+            'open_time':g[0]['open_time'],'open':g[0]['open'],'high':max(x['high'] for x in g),
+            'low':min(x['low'] for x in g),'close':g[-1]['close'],
+            'volume':sum(x['volume'] for x in g)
+        })
+    return out
+
+def historical_backtest(symbol, lookback=400, forward=36):
+    # Research-only walk-forward simulation using one historical 5M stream and
+    # deterministic 15M/1H resampling. This is separate from live trade stats.
+    lookback=max(100,min(900,int(lookback)))
+    forward=max(6,min(120,int(forward)))
+    c5=fetch_klines(symbol,'5m',min(1000,lookback+forward+260))
+    c15=_resample_5m(c5,15); c1h=_resample_5m(c5,60)
+    results=[]
+    # Need enough warm-up for EMA200 + swings.
+    for i in range(220,len(c5)-forward-1):
+        try:
+            c5h=c5[:i+1]
+            c15h=c15[:max(1,(i+1)//3)]
+            c1hh=c1h[:max(1,(i+1)//12)]
+            if len(c15h)<80 or len(c1hh)<210:
+                continue
+            a1=analyze_tf(c1hh); a2=analyze_tf(c15h); a3=analyze_tf(c5h)
+            if a1['structure_bias']=='NEUTRAL':
+                continue
+            direction='LONG' if a1['structure_bias']=='BULLISH' else 'SHORT'
+            if not ((direction=='LONG' and a1['price']>a1['ema200']) or
+                    (direction=='SHORT' and a1['price']<a1['ema200'])):
+                continue
+            zone=detect_zone(c15h,direction); fvg=detect_fvg(c15h,direction)
+            poi=zone or fvg
+            price=a3['price']
+            if not poi or not (poi['low']<=price<=poi['high']):
+                continue
+            sweep=a3['bull_sweep'] if direction=='LONG' else a3['bear_sweep']
+            bos=a3['bull_bos'] if direction=='LONG' else a3['bear_bos']
+            if not (sweep and bos):
+                continue
+            atrv=a3['atr'] or price*0.005
+            inv=a3.get('bull_sweep_level') if direction=='LONG' else a3.get('bear_sweep_level')
+            if inv is None:
+                continue
+            sl=(min(inv-0.25*atrv,price-0.6*atrv) if direction=='LONG'
+                else max(inv+0.25*atrv,price+0.6*atrv))
+            risk=abs(price-sl)
+            tp1,tp2,tp3=_choose_targets(a1,a2,direction,price,risk)
+            outcome='NO_HIT'; r_mult=None
+            for fc in c5[i+1:i+1+forward]:
+                hi,lo=fc['high'],fc['low']
+                slhit=(lo<=sl) if direction=='LONG' else (hi>=sl)
+                t3hit=(hi>=tp3) if direction=='LONG' else (lo<=tp3)
+                if slhit and t3hit:
+                    outcome='AMBIGUOUS'; r_mult=None; break
+                if slhit:
+                    outcome='SL'; r_mult=-1.0; break
+                if t3hit:
+                    outcome='TP3'; r_mult=abs(tp3-price)/risk; break
+            if outcome!='NO_HIT':
+                results.append({'index':i,'entry':price,'direction':direction,'outcome':outcome,'r':r_mult})
+        except Exception:
+            continue
+
+    n=len(results)
+    wins=sum(x['outcome']=='TP3' for x in results)
+    losses=sum(x['outcome']=='SL' for x in results)
+    amb=sum(x['outcome']=='AMBIGUOUS' for x in results)
+    rvals=[x['r'] for x in results if x['r'] is not None]
+    return {
+        'type':'historical_walk_forward_research',
+        'symbol':symbol,'signals':n,'tp3_wins':wins,'sl_losses':losses,
+        'ambiguous':amb,'win_rate_excluding_ambiguous':round(wins/(wins+losses)*100,2) if wins+losses else None,
+        'expectancy_r_excluding_ambiguous':round(sum(rvals)/len(rvals),3) if rvals else None,
+        'note':'Research engine is separate from live stats; ambiguous OHLC candles are not counted as wins or losses.'
+    }
+
+@app.get('/api/historical-backtest')
+def api_historical_backtest():
+    symbol=request.args.get('symbol',(WATCHLIST[0] if WATCHLIST else 'BTCUSDT')).upper()
+    lookback=int(request.args.get('lookback',400))
+    forward=int(request.args.get('forward',36))
+    try:
+        return jsonify(historical_backtest(symbol,lookback,forward))
+    except Exception as exc:
+        return jsonify({'error':f'{type(exc).__name__}: {exc}'}),500
+
+# ---------------- Dashboard helpers ----------------
+def send_trade_summary():
+    s=stats()
+    telegram_send(
+        f'📊 *TRADE STATS*\\n'
+        f'Closed: `{s["closed"]}`\\n'
+        f'TP3 Win: `{s["wins"]}`\\n'
+        f'SL Loss: `{s["losses"]}`\\n'
+        f'TP1 Rate: `{s["tp1_rate"]}%`\\n'
+        f'Positive Rate: `{s["positive_rate"]}%`\\n'
+        f'Expectancy: `{s["expectancy_r"] if s["expectancy_r"] is not None else "—"}R`'
+    )
+
+# Disable the old limit path unless explicitly requested.
+if not ENABLE_PENDING_LIMITS:
+    PENDING_LIMIT_MIN_SCORE=101
+else:
+    PENDING_LIMIT_MIN_SCORE=max(0,int(os.getenv('PENDING_LIMIT_MIN_SCORE',str(MIN_SCORE))))
 
 # ----------------------------- Startup --------------------------------
 init_db()
@@ -1999,3 +2985,7 @@ def setup_status():
     ai = request.args.get("ai", "").upper()
     result = classify_setup(score, {"decision": ai} if ai else None)
     return jsonify(result)
+
+
+
+
