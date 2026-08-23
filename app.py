@@ -606,14 +606,39 @@ def analyze_tf(c):
     }
 
 def detect_zone(c, direction):
-    # Lightweight OB/FVG proxy: use last opposite candle before a displacement candle.
+    """Order block: the last opposite-color candle before a genuine
+    displacement move. Two real gaps fixed here:
+    1. FRESHNESS -- previously returned ANY opposite-candle pair in the last
+       12 candles with no check on whether price already came back and
+       retested/mitigated that zone since it formed. A zone price has
+       already tapped multiple times has far less real resting liquidity
+       left than a genuinely untouched one -- this now skips any candidate
+       zone that price has already revisited, continuing the search further
+       back for one that's actually still fresh.
+    2. DISPLACEMENT SIZE -- previously accepted the confirming candle purely
+       by its close>open direction, with no size check at all, so a tiny
+       1-tick candle counted the same as a genuine impulsive break. Now
+       requires the confirming candle's body to be at least 1x the recent
+       average body size.
+    """
     if len(c)<5: return None
+    bodies=[abs(x['close']-x['open']) for x in c[-20:]]
+    avg_body=sum(bodies)/len(bodies) if bodies else 0
     for i in range(len(c)-2, max(1,len(c)-12), -1):
         cur=c[i+1]; prev=c[i]
+        cur_body=abs(cur['close']-cur['open'])
+        if cur_body < avg_body*1.0:
+            continue
         if direction=='LONG' and cur['close']>cur['open'] and prev['close']<prev['open']:
-            return {'low':prev['low'], 'high':prev['high'], 'type':'bullish_ob'}
+            zlow,zhigh=prev['low'],prev['high']
+            mitigated=any(x['low']<=zhigh for x in c[i+2:-1])
+            if mitigated: continue
+            return {'low':zlow, 'high':zhigh, 'type':'bullish_ob', 'fresh':True}
         if direction=='SHORT' and cur['close']<cur['open'] and prev['close']>prev['open']:
-            return {'low':prev['low'], 'high':prev['high'], 'type':'bearish_ob'}
+            zlow,zhigh=prev['low'],prev['high']
+            mitigated=any(x['high']>=zlow for x in c[i+2:-1])
+            if mitigated: continue
+            return {'low':zlow, 'high':zhigh, 'type':'bearish_ob', 'fresh':True}
     return None
 
 
@@ -681,16 +706,23 @@ def detect_choch(c, bias, window=3):
     data: 0/17 real closed trades ever had choch=true. Loosened to "not
     already aligned the same way" (BEARISH or NEUTRAL) so it can actually
     fire on genuine early-transition setups instead of being permanently dead.
+
+    Second fix: was checking ONLY the literal last candle's close against the
+    swing point (`last['close'] > last_swing_high`) -- the exact same class
+    of bug already found and fixed in BOS. A break that happened 1-2 candles
+    ago and is still holding is just as valid/fresh as one on the current
+    bar; requiring the EXACT last candle meant quant would miss a CHoCH that
+    Gemini (looking at the whole recent picture) correctly saw.
     """
     out = {'bull_choch': False, 'bear_choch': False}
     highs, lows = swing_levels(c, window)
     if not highs or not lows:
         return out
-    last = c[-1]
     last_swing_high = highs[-1][1]
     last_swing_low = lows[-1][1]
-    out['bull_choch'] = bias != 'BULLISH' and last['close'] > last_swing_high
-    out['bear_choch'] = bias != 'BEARISH' and last['close'] < last_swing_low
+    recent2=c[-2:]
+    out['bull_choch'] = bias != 'BULLISH' and any(x['close'] > last_swing_high for x in recent2)
+    out['bear_choch'] = bias != 'BEARISH' and any(x['close'] < last_swing_low for x in recent2)
     return out
 
 def detect_fvg(c, direction, lookback=15):
