@@ -999,6 +999,13 @@ def build_analysis(symbol):
         'direction':direction,'score':score,'price':price,'entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'tp3':tp3,'rr':rr,
         'reasons':reasons[direction], 'tf':{tf1:a1,tf2:a2,tf3:a3},
         'candles':{tf1:_compact_candles(c1),tf2:_compact_candles(c2),tf3:_compact_candles(c3)},
+        # Full-precision, full-length candle lists (not the 15-candle,
+        # short-key 'o/h/l/c/v' payload above, which exists only to save
+        # Gemini tokens). The patched build_analysis() below reads from
+        # here so its detectors get the full 220/160/160 history with the
+        # 'close'/'volume' keys they expect, instead of KeyError'ing on
+        # the compact payload.
+        '_raw':{tf1:c1, tf2:c2, tf3:c3},
         'factor_flags':factor_flags,
         # Hard-filter flags: HTF bias and trend regime are the two factors
         # whose "absent" bucket has shown a 0% win rate consistently across
@@ -2240,7 +2247,7 @@ def build_analysis(symbol):
     # One market-data snapshot only; all detectors consume the same candles.
     a=_build_analysis_legacy(symbol)
     tf1,tf2,tf3=TIMEFRAMES
-    c1=a['candles'][tf1]; c2=a['candles'][tf2]; c3=a['candles'][tf3]
+    c1=a['_raw'][tf1]; c2=a['_raw'][tf2]; c3=a['_raw'][tf3]
     a1,a2,a3=analyze_tf(c1),analyze_tf(c2),analyze_tf(c3)
 
     scores={'LONG':0.0,'SHORT':0.0}
@@ -2985,7 +2992,3 @@ def setup_status():
     ai = request.args.get("ai", "").upper()
     result = classify_setup(score, {"decision": ai} if ai else None)
     return jsonify(result)
-
-
-
-
