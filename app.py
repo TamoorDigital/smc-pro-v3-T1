@@ -777,7 +777,7 @@ def build_analysis(symbol):
     # gated as a HARD FILTER below (build_analysis returns a "no_trade"
     # candidate if this is absent), not just a score weight.
     sep=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
-    trend_regime_ok = sep >= 0.65
+    trend_regime_ok = sep >= 1.0
     if trend_regime_ok:
         for d in scores: scores[d]+=15 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
         if a1['bias'] in ('BULLISH','BEARISH'): reasons[a1['bias'].replace('BULLISH','LONG').replace('BEARISH','SHORT')].append('trending regime')
@@ -2260,13 +2260,21 @@ def build_analysis(symbol):
     c1=a['_raw'][tf1]; c2=a['_raw'][tf2]; c3=a['_raw'][tf3]
     a1,a2,a3=analyze_tf(c1),analyze_tf(c2),analyze_tf(c3)
 
+    # Diagnostic: log the real 1h EMA20/EMA50/ATR numbers behind
+    # trend_regime every scan, so "is it a code bug or is the market just
+    # not trending" can be answered from actual data instead of guessing.
+    _trend_ratio = abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
+    log.info('[TREND_REGIME] %s ema20=%.6g ema50=%.6g atr1h=%.6g ratio=%.3f threshold=%.3f -> %s',
+              symbol, a1['ema20'], a1['ema50'], a1['atr'], _trend_ratio,
+              TREND_REGIME_ATR_MULT, 'PASS' if _trend_ratio>=TREND_REGIME_ATR_MULT else 'fail')
+
     scores={'LONG':0.0,'SHORT':0.0}
     reasons={'LONG':[],'SHORT':[]}
     flags_by_dir={}
     for d in ('LONG','SHORT'):
         htf_ok=(a1['structure_bias']=='BULLISH' and d=='LONG') or (a1['structure_bias']=='BEARISH' and d=='SHORT')
         ema_ok=(a1.get('ema200') is None or (d=='LONG' and a1['price']>a1['ema200']) or (d=='SHORT' and a1['price']<a1['ema200']))
-        trend_ok=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)>=1.0
+        trend_ok=_trend_ratio>=TREND_REGIME_ATR_MULT
 
         zone=detect_zone(c2,d)
         fvg=detect_fvg(c2,d)
@@ -2422,6 +2430,10 @@ Return ONLY JSON:
     return gemini_json(system,prompt,max_output_tokens=1800)
 
 SL_STRUCTURE_TOLERANCE_ATR = max(0.1, float(os.getenv('SL_STRUCTURE_TOLERANCE_ATR', '1.5')))
+# How much EMA20/EMA50 must separate (in ATR units, 1h) before trend_regime
+# counts as aligned. Diagnostic logging below reports the real ratio every
+# scan so this can be tuned from observed numbers instead of guessing.
+TREND_REGIME_ATR_MULT = max(0.05, float(os.getenv('TREND_REGIME_ATR_MULT', '0.7')))
 
 def _verify_sl_against_structure(direction, sl, structure_levels):
     """Cross-checks Gemini's proposed SL against the SAME structural points
