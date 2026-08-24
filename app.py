@@ -777,7 +777,7 @@ def build_analysis(symbol):
     # gated as a HARD FILTER below (build_analysis returns a "no_trade"
     # candidate if this is absent), not just a score weight.
     sep=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
-    trend_regime_ok = sep >= 1.0
+    trend_regime_ok = sep >= 0.65
     if trend_regime_ok:
         for d in scores: scores[d]+=15 if ((d=='LONG' and a1['bias']=='BULLISH') or (d=='SHORT' and a1['bias']=='BEARISH')) else 0
         if a1['bias'] in ('BULLISH','BEARISH'): reasons[a1['bias'].replace('BULLISH','LONG').replace('BEARISH','SHORT')].append('trending regime')
