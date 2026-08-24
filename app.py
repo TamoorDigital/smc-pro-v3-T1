@@ -2068,6 +2068,14 @@ def init_db():
                 con.execute(f'ALTER TABLE trades ADD COLUMN {col} {typ}')
             except sqlite3.OperationalError:
                 pass
+        for col, typ in [
+            ('htf_bias_score','REAL'),
+            ('trend_regime_score','REAL'),
+        ]:
+            try:
+                con.execute(f'ALTER TABLE scans ADD COLUMN {col} {typ}')
+            except sqlite3.OperationalError:
+                pass
         con.commit()
         con.close()
 
@@ -2271,10 +2279,15 @@ def build_analysis(symbol):
     scores={'LONG':0.0,'SHORT':0.0}
     reasons={'LONG':[],'SHORT':[]}
     flags_by_dir={}
+    htf_strength_by_dir={}
     for d in ('LONG','SHORT'):
-        htf_ok=(a1['structure_bias']=='BULLISH' and d=='LONG') or (a1['structure_bias']=='BEARISH' and d=='SHORT')
         ema_ok=(a1.get('ema200') is None or (d=='LONG' and a1['price']>a1['ema200']) or (d=='SHORT' and a1['price']<a1['ema200']))
+        htf_strength=_htf_bias_strength(a1,d,ema_ok)
+        htf_ok=htf_strength>=HTF_BIAS_MIN_STRENGTH
+        htf_strength_by_dir[d]=htf_strength
         trend_ok=_trend_ratio>=TREND_REGIME_ATR_MULT
+        log.info('[HTF_BIAS] %s dir=%s strength=%.2f threshold=%.2f -> %s',
+                  symbol, d, htf_strength, HTF_BIAS_MIN_STRENGTH, 'PASS' if htf_ok else 'fail')
 
         zone=detect_zone(c2,d)
         fvg=detect_fvg(c2,d)
@@ -2304,7 +2317,7 @@ def build_analysis(symbol):
         if pbonus>0: scores[d]+=2; reasons[d].append('supportive candle pattern')
 
         flags_by_dir[d]={
-            'htf_bias':htf_ok and ema_ok,
+            'htf_bias':htf_ok,
             'trend_regime':trend_ok,
             'liquidity_sweep':bool(sweep),
             'bos':bool(bos),
@@ -2383,6 +2396,8 @@ def build_analysis(symbol):
         'factor_flags':flags,
         'htf_bias_ok':bool(hard_htf),
         'trend_regime_ok':bool(hard_trend),
+        'htf_bias_score':round(htf_strength_by_dir.get(direction,0.0),3) if direction else 0.0,
+        'trend_regime_score':round(_trend_ratio,3),
         'zone_entry':None,
         'structure_levels':structure_levels,
     })
@@ -2433,7 +2448,35 @@ SL_STRUCTURE_TOLERANCE_ATR = max(0.1, float(os.getenv('SL_STRUCTURE_TOLERANCE_AT
 # How much EMA20/EMA50 must separate (in ATR units, 1h) before trend_regime
 # counts as aligned. Diagnostic logging below reports the real ratio every
 # scan so this can be tuned from observed numbers instead of guessing.
-TREND_REGIME_ATR_MULT = max(0.05, float(os.getenv('TREND_REGIME_ATR_MULT', '0.7')))
+TREND_REGIME_ATR_MULT = max(0.05, float(os.getenv('TREND_REGIME_ATR_MULT', '0.6')))
+# Graded (0-1) version of the HTF bias check instead of the old strict
+# all-4-conditions AND. Mirrors TREND_REGIME_ATR_MULT's ratio+threshold
+# pattern -- see _htf_bias_strength() for what the 4 components are.
+HTF_BIAS_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('HTF_BIAS_MIN_STRENGTH', '0.7'))))
+
+def _htf_bias_strength(a1, direction, ema_ok):
+    """0-1 graded HTF bias strength for the 1h timeframe, direction-aware.
+    4 equally-weighted signals (0.25 each), partial credit instead of the
+    old all-or-nothing AND:
+      - latest swing high higher (LONG) / lower (SHORT) than the prior one
+      - latest swing low higher (LONG) / lower (SHORT) than the prior one
+      - price on the correct side of EMA200 (same check trend_regime uses)
+      - a1['bias'] (structure bias, falling back to EMA20/50 slope when
+        structure is NEUTRAL) agrees with direction
+    """
+    highs=a1.get('swing_highs') or []; lows=a1.get('swing_lows') or []
+    score=0.0
+    if len(highs)>=2:
+        if (direction=='LONG' and highs[-1][1]>highs[-2][1]) or (direction=='SHORT' and highs[-1][1]<highs[-2][1]):
+            score+=0.25
+    if len(lows)>=2:
+        if (direction=='LONG' and lows[-1][1]>lows[-2][1]) or (direction=='SHORT' and lows[-1][1]<lows[-2][1]):
+            score+=0.25
+    if ema_ok:
+        score+=0.25
+    if a1.get('bias')==('BULLISH' if direction=='LONG' else 'BEARISH'):
+        score+=0.25
+    return score
 
 def _verify_sl_against_structure(direction, sl, structure_levels):
     """Cross-checks Gemini's proposed SL against the SAME structural points
@@ -2561,7 +2604,9 @@ def scan_once(force=False):
             try:
                 a=build_analysis(symbol)
                 analyses.append(a)
-                result['symbols'][symbol]={'score':a['score'],'decision':'RANKED'}
+                result['symbols'][symbol]={'score':a['score'],'decision':'RANKED',
+                                            'htf_bias_score':a.get('htf_bias_score'),
+                                            'trend_regime_score':a.get('trend_regime_score')}
             except Exception as e:
                 err=f'{type(e).__name__}: {e}'
                 LAST_ERROR=f'{symbol}: {err}'
@@ -2608,8 +2653,8 @@ def scan_once(force=False):
                     decision=f'WATCHING_{status}' if WATCH_STATE_ENABLED else 'ELIGIBLE'
                     reason=note
                 con.execute(
-                    'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
-                    (now,a['symbol'],a['score'],decision,0,reason[:500])
+                    'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason,htf_bias_score,trend_regime_score) VALUES(?,?,?,?,?,?,?,?)',
+                    (now,a['symbol'],a['score'],decision,0,reason[:500],a.get('htf_bias_score'),a.get('trend_regime_score'))
                 )
             con.commit(); con.close()
 
