@@ -1198,7 +1198,13 @@ def has_open_similar(symbol,direction):
         con=db(); row=con.execute("SELECT 1 FROM trades WHERE symbol=? AND direction=? AND status IN ('WAITING_ENTRY','OPEN','PENDING_LIMIT') LIMIT 1",(symbol,direction)).fetchone(); con.close()
     return bool(row)
 
-PENDING_LIMIT_MIN_SCORE = max(0, int(os.getenv('PENDING_LIMIT_MIN_SCORE', str(MIN_SCORE))))
+# Zone-stage score can never reach MIN_SCORE (70) -- sweep/BOS/CHoCH/CRT
+# (33 of the 93 max points) are structurally unavailable pre-trigger.
+# htf_bias+trend_regime+POI (already required to reach ZONE_REACHED)
+# guarantee a 53-point floor, so that's the reasoned default here -- real
+# filtering at this stage comes from Gemini's independent zone judgment
+# (gemini_validate_zone), not the quant score alone.
+PENDING_LIMIT_MIN_SCORE = max(0, int(os.getenv('PENDING_LIMIT_MIN_SCORE', '53')))
 PENDING_LIMIT_TIMEOUT_MIN = max(0, int(os.getenv('PENDING_LIMIT_TIMEOUT_MIN', '150')))
 
 def insert_pending_limit(a):
@@ -1999,7 +2005,7 @@ def dashboard():
 #  11) factor report is explicitly forward/observational; it cannot silently
 #      become a weight optimizer from tiny samples.
 
-ENABLE_PENDING_LIMITS = os.getenv('ENABLE_PENDING_LIMITS', '0').strip().lower() in ('1','true','yes','on')
+ENABLE_PENDING_LIMITS = os.getenv('ENABLE_PENDING_LIMITS', '1').strip().lower() in ('1','true','yes','on')
 MAX_GEMINI_CANDIDATES = max(1, int(os.getenv('MAX_GEMINI_CANDIDATES', '3')))
 MAX_CONCURRENT_TRADES = max(1, int(os.getenv('MAX_CONCURRENT_TRADES', '3')))
 
@@ -2444,6 +2450,127 @@ Return ONLY JSON:
 }"""
     return gemini_json(system,prompt,max_output_tokens=1800)
 
+def _validate_and_correct_gemini_levels(best, ai):
+    """Shared APPROVE/REJECT + SL-structure-correction pipeline for any
+    Gemini validation result against a quant candidate `best`. Used by both
+    the full-trigger approval path and the pre-trigger zone-limit path so
+    the same direction/structure-agreement/SL-verification rules apply
+    everywhere a Gemini result gets turned into a trade.
+    Returns (approved, trade_plan, reason, gemini_score).
+    """
+    try:
+        gemini_score=float(ai.get('score',ai.get('confidence',0)) or 0)
+    except (TypeError,ValueError):
+        gemini_score=0.0
+
+    approved=False; trade_plan=None
+    reason=ai.get('reason','Gemini rejected')
+    if str(ai.get('decision','REJECT')).upper()=='APPROVE' and gemini_score>=GEMINI_MIN_SCORE:
+        positive,checked,agreement=structure_agreement(best.get('factor_flags',{}),ai)
+        g_direction=str(ai.get('direction') or '').upper()
+        if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
+            reason='Gemini direction disagrees with quant direction'
+        elif checked>=3 and (positive<MIN_STRUCTURE_AGREEMENTS or agreement<MAX_STRUCTURE_DISAGREEMENT):
+            reason=(f'Insufficient positive structure agreement: '
+                    f'{positive} positive / {checked} checked, ratio={agreement:.2f}')
+        else:
+            try:
+                vals=[float(ai[k]) for k in ('entry','sl','tp1','tp2','tp3')]
+                g_entry,g_sl,g_tp1,g_tp2,g_tp3=vals
+            except (KeyError,TypeError,ValueError):
+                reason='Gemini approval missing valid trade levels'
+            else:
+                ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
+                if not ok:
+                    reason=why
+                else:
+                    sl_ok,sl_why,nearest_ref=_verify_sl_against_structure(
+                        g_direction,g_sl,best.get('structure_levels',{})
+                    )
+                    if sl_ok:
+                        final_sl,final_tp1,final_tp2,final_tp3=g_sl,g_tp1,g_tp2,g_tp3
+                        level_note=sl_why
+                    elif nearest_ref is not None:
+                        atrv=best.get('structure_levels',{}).get('atr_5m') or abs(g_entry)*0.005
+                        final_sl,final_tp1,final_tp2,final_tp3=_correct_sl_to_structure(
+                            g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3,nearest_ref,atrv
+                        )
+                        level_note=f'SL auto-corrected to structure ({sl_why})'
+                    else:
+                        final_sl=None; level_note=sl_why
+
+                    if final_sl is None:
+                        reason=f'SL structure check failed, no structural reference to correct to: {sl_why}'
+                    else:
+                        ok2,why2=_final_level_check(g_direction,g_entry,final_sl,final_tp1,final_tp2,final_tp3)
+                        if not ok2:
+                            reason=f'SL-corrected levels still invalid: {why2} ({level_note})'
+                        else:
+                            trade_plan=dict(best)
+                            trade_plan.update({
+                                'direction':g_direction,'entry':g_entry,'sl':final_sl,
+                                'tp1':final_tp1,'tp2':final_tp2,'tp3':final_tp3,
+                                'rr':abs(final_tp2-g_entry)/max(abs(g_entry-final_sl),1e-12)
+                            })
+                            approved=True
+                            reason=ai.get('reason',why)+f' | {level_note}'
+    return approved, trade_plan, reason, gemini_score
+
+
+def gemini_validate_zone(analysis):
+    """Lighter, differently-framed Gemini call for the PRE-trigger zone
+    stage: price has just reached a 15M order-block/FVG (ZONE_REACHED),
+    but the 5M sweep/BOS/CHoCH hasn't happened yet -- there's no
+    confirmed trigger to describe. Ask a narrower question instead:
+    does this zone look like a genuine reaction point worth a resting
+    LIMIT order, given HTF bias/trend and the zone's own structure?
+    Same JSON response schema as gemini_validate() so the SAME
+    downstream approval/structure/SL pipeline (_validate_and_correct_
+    gemini_levels) works unchanged for this path too."""
+    prompt={
+        'task':('Price has just reached a 15M order block / FVG zone. No 5M sweep, '
+                'BOS, or CHOCH has been confirmed yet -- do not claim one has. '
+                'Independently judge whether this zone is a genuine reaction point '
+                'worth a resting LIMIT order, using ONLY the raw OHLCV supplied.'),
+        'symbol':analysis['symbol'],
+        'framework':analysis['framework'],
+        'timeframes':analysis['timeframes'],
+        'raw_ohlcv_candles':analysis.get('candles',{}),
+        'timeframe_analysis':{
+            k:{
+                x:(_round_price(v) if x in ('ema20','ema50','ema200','atr','price')
+                   else (round(v,2) if x in ('rsi','volume_ratio') else v))
+                for x,v in av.items()
+                if x not in ('high','low','range','swing_highs','swing_lows')
+            } for k,av in analysis['tf'].items()
+        }
+    }
+    system="""You are an independent second analyst for a crypto trading research bot.
+Use ONLY the supplied raw OHLCV candles and derived neutral market data.
+Do NOT receive or use a quant score, quant direction, quant Entry/SL/TP, or quant reasons.
+This is a PRE-trigger check: price has reached a 15M order block/FVG zone, but no
+5M sweep/BOS/CHOCH has happened yet. Judge the zone itself: is it a real, clean
+structural level (not mid-range, not already violated), does HTF bias/trend support
+a reaction from here, and would a LIMIT order resting at this zone (not chasing
+price) make sense? Propose an entry AT or very near the zone edge, an invalidation
+stop just beyond the real structure on the other side, and TP1/TP2/TP3 with TP2 at
+least 2R. If the zone looks weak, already mitigated, or unsupported by HTF
+bias/trend, REJECT.
+Return ONLY JSON:
+{
+ "decision":"APPROVE|REJECT",
+ "direction":"LONG|SHORT",
+ "score":0-100,
+ "confidence":0-100,
+ "entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,
+ "bos_detected":true/false,"choch_detected":true/false,
+ "order_block_detected":true/false,"fvg_detected":true/false,
+ "crt_detected":true/false,"tbs_detected":true/false,
+ "reason":"brief evidence-based reason"
+}"""
+    return gemini_json(system,prompt,max_output_tokens=1800)
+
+
 SL_STRUCTURE_TOLERANCE_ATR = max(0.1, float(os.getenv('SL_STRUCTURE_TOLERANCE_ATR', '1.5')))
 # How much EMA20/EMA50 must separate (in ATR units, 1h) before trend_regime
 # counts as aligned. Diagnostic logging below reports the real ratio every
@@ -2452,7 +2579,7 @@ TREND_REGIME_ATR_MULT = max(0.05, float(os.getenv('TREND_REGIME_ATR_MULT', '0.6'
 # Graded (0-1) version of the HTF bias check instead of the old strict
 # all-4-conditions AND. Mirrors TREND_REGIME_ATR_MULT's ratio+threshold
 # pattern -- see _htf_bias_strength() for what the 4 components are.
-HTF_BIAS_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('HTF_BIAS_MIN_STRENGTH', '0.7'))))
+HTF_BIAS_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('HTF_BIAS_MIN_STRENGTH', '0.6'))))
 
 def _htf_bias_strength(a1, direction, ema_ok):
     """0-1 graded HTF bias strength for the 1h timeframe, direction-aware.
@@ -2588,6 +2715,54 @@ def _final_level_check(direction, entry, sl, tp1, tp2, tp3):
     return True,'OK'
 
 # ---------------- Watch-state / scan execution ----------------
+def _try_zone_limit_order(a):
+    """Called once per scan cycle a candidate is freshly ZONE_REACHED and
+    scores >= PENDING_LIMIT_MIN_SCORE. Gets an independent Gemini read on
+    the zone itself (no trigger has happened yet), runs it through the
+    SAME approval/structure/SL pipeline as the full-trigger path, and
+    places a resting limit order at the zone if approved. Returns
+    (status, note) for the caller's watch-state log line.
+    """
+    symbol=a['symbol']; score=float(a.get('score',0))
+    try:
+        ai=gemini_validate_zone(a)
+    except Exception as exc:
+        reason=f'Gemini zone error: {type(exc).__name__}: {exc}'
+        with DB_LOCK:
+            con=db()
+            con.execute(
+                'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason,htf_bias_score,trend_regime_score) VALUES(?,?,?,?,?,?,?,?)',
+                (now_utc(),symbol,score,'ZONE_LIMIT_ERROR',1,reason,a.get('htf_bias_score'),a.get('trend_regime_score'))
+            )
+            con.commit(); con.close()
+        return 'ZONE_REACHED', f'limit-order zone check errored: {reason}'
+
+    approved,trade_plan,reason,gemini_score=_validate_and_correct_gemini_levels(a,ai)
+    decision='ZONE_LIMIT_APPROVED' if approved else 'ZONE_LIMIT_REJECTED'
+    with DB_LOCK:
+        con=db()
+        con.execute(
+            'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason,htf_bias_score,trend_regime_score) VALUES(?,?,?,?,?,?,?,?)',
+            (now_utc(),symbol,score,decision,1,f'[Gemini zone {gemini_score:.0f}] {reason}',
+             a.get('htf_bias_score'),a.get('trend_regime_score'))
+        )
+        con.commit(); con.close()
+
+    if not approved:
+        return 'ZONE_REACHED', f'limit order not placed: {reason}'
+
+    pid=insert_pending_limit(a, levels=trade_plan)
+    if pid is None:
+        return 'ZONE_REACHED', 'Gemini approved the zone but ENABLE_PENDING_LIMITS is off'
+    telegram_send(
+        f'\U0001F440 *LIMIT ORDER PLACED (Gemini-approved zone) \u2014 {symbol} {trade_plan["direction"]}*\n'
+        f'Trade #{pid}\nWatching for fill at `{fmt_price(trade_plan["entry"])}`\n'
+        f'Quant Score: `{score:.0f}/100` | Gemini Score: `{gemini_score:.0f}/100`\n'
+        f'SL `{fmt_price(trade_plan["sl"])}` will be refined from the real sweep candle once filled.'
+    )
+    return 'ZONE_REACHED', f'limit order placed at zone (Gemini-approved, id={pid})'
+
+
 def scan_once(force=False):
     global LAST_SCAN,LAST_ERROR
     if not scanner_is_active() and not force:
@@ -2628,6 +2803,15 @@ def scan_once(force=False):
                 watch_notes[a['symbol']]=(status,note)
                 if status=='TRIGGERED':
                     triggered.append(a)
+                elif (status=='ZONE_REACHED' and ENABLE_PENDING_LIMITS
+                      and float(a.get('score',0))>=PENDING_LIMIT_MIN_SCORE
+                      and not has_open_similar(a['symbol'],a['direction'])):
+                    # Good-scoring setup has reached its zone but hasn't
+                    # triggered yet -- get Gemini's independent read on the
+                    # ZONE ITSELF (not a claimed trigger) and place a
+                    # resting limit order there if approved, instead of
+                    # waiting out the full sweep/BOS confirmation.
+                    watch_notes[a['symbol']]=_try_zone_limit_order(a)
         else:
             triggered=list(eligible)
 
@@ -2682,73 +2866,7 @@ def scan_once(force=False):
                     con.commit(); con.close()
                 continue
 
-            try:
-                gemini_score=float(ai.get('score',ai.get('confidence',0)) or 0)
-            except (TypeError,ValueError):
-                gemini_score=0.0
-
-            approved=False; trade_plan=None
-            reason=ai.get('reason','Gemini rejected')
-            if str(ai.get('decision','REJECT')).upper()=='APPROVE' and gemini_score>=GEMINI_MIN_SCORE:
-                positive,checked,agreement=structure_agreement(best.get('factor_flags',{}),ai)
-                g_direction=str(ai.get('direction') or '').upper()
-                if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
-                    reason='Gemini direction disagrees with quant direction'
-                elif checked>=3 and (positive<MIN_STRUCTURE_AGREEMENTS or agreement<MAX_STRUCTURE_DISAGREEMENT):
-                    reason=(f'Insufficient positive structure agreement: '
-                            f'{positive} positive / {checked} checked, ratio={agreement:.2f}')
-                else:
-                    try:
-                        vals=[float(ai[k]) for k in ('entry','sl','tp1','tp2','tp3')]
-                        g_entry,g_sl,g_tp1,g_tp2,g_tp3=vals
-                    except (KeyError,TypeError,ValueError):
-                        reason='Gemini approval missing valid trade levels'
-                    else:
-                        ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
-                        if not ok:
-                            reason=why
-                        else:
-                            # Ordering/R:R sane != actually grounded in
-                            # structure. Cross-check Gemini's SL against the
-                            # SAME swing/sweep/OB levels quant's own
-                            # detectors found on these candles, before
-                            # trusting it enough to send out.
-                            sl_ok,sl_why,nearest_ref=_verify_sl_against_structure(
-                                g_direction,g_sl,best.get('structure_levels',{})
-                            )
-                            if sl_ok:
-                                final_sl,final_tp1,final_tp2,final_tp3=g_sl,g_tp1,g_tp2,g_tp3
-                                level_note=sl_why
-                            elif nearest_ref is not None:
-                                # Don't throw away an otherwise-approved setup
-                                # over a badly-placed SL number -- rebuild SL
-                                # from the REAL structural point closest to
-                                # what Gemini proposed (quant's own placement
-                                # formula), and re-anchor TP1/2/3 at Gemini's
-                                # intended R-multiples off the corrected risk.
-                                atrv=best.get('structure_levels',{}).get('atr_5m') or abs(g_entry)*0.005
-                                final_sl,final_tp1,final_tp2,final_tp3=_correct_sl_to_structure(
-                                    g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3,nearest_ref,atrv
-                                )
-                                level_note=f'SL auto-corrected to structure ({sl_why})'
-                            else:
-                                final_sl=None; level_note=sl_why
-
-                            if final_sl is None:
-                                reason=f'SL structure check failed, no structural reference to correct to: {sl_why}'
-                            else:
-                                ok2,why2=_final_level_check(g_direction,g_entry,final_sl,final_tp1,final_tp2,final_tp3)
-                                if not ok2:
-                                    reason=f'SL-corrected levels still invalid: {why2} ({level_note})'
-                                else:
-                                    trade_plan=dict(best)
-                                    trade_plan.update({
-                                        'direction':g_direction,'entry':g_entry,'sl':final_sl,
-                                        'tp1':final_tp1,'tp2':final_tp2,'tp3':final_tp3,
-                                        'rr':abs(final_tp2-g_entry)/max(abs(g_entry-final_sl),1e-12)
-                                    })
-                                    approved=True
-                                    reason=ai.get('reason',why)+f' | {level_note}'
+            approved,trade_plan,reason,gemini_score=_validate_and_correct_gemini_levels(best,ai)
 
             decision='APPROVED' if approved else 'REJECTED'
             with DB_LOCK:
@@ -2797,16 +2915,44 @@ def insert_trade(a,ai):
         con.commit(); con.close()
     return tid
 
-def insert_pending_limit(a):
-    # Separate experimental path. It is OFF by default and is NEVER included
-    # in MARKET_GEMINI factor statistics.
+def insert_pending_limit(a, levels=None):
+    """A limit-order 'watch' -- created once a good-scoring setup reaches
+    its 15M zone (ZONE_REACHED) AND Gemini has independently approved the
+    zone itself (see gemini_validate_zone), rather than waiting for the
+    full 5M sweep/BOS/CHoCH trigger. Avoids "chasing" an extended move
+    (Gemini's #1 rejection reason on the trigger path) by construction --
+    the order just rests at the zone.
+    `levels`, when given, overrides entry/sl/tp1/2/3 with Gemini's own
+    zone-stage numbers (already structure-verified by
+    _validate_and_correct_gemini_levels); falls back to quant's own `a`
+    levels only if no override is supplied (legacy/manual-call path).
+    Gated on ENABLE_PENDING_LIMITS (off by default) -- never included in
+    MARKET_GEMINI factor statistics; tagged with its own trade_type."""
     if not ENABLE_PENDING_LIMITS:
         return None
-    tid=_insert_pending_limit_legacy(a)
+    lv=levels or {}
+    entry=lv.get('entry') or a.get('zone_entry') or a.get('entry')
+    sl=lv.get('sl', a.get('sl')); tp1=lv.get('tp1', a.get('tp1')); tp2=lv.get('tp2', a.get('tp2')); tp3=lv.get('tp3', a.get('tp3'))
+    risk_orig=abs(entry-sl) or 1e-9
+    multipliers={
+        'tp1': abs(tp1-entry)/risk_orig,
+        'tp2': abs(tp2-entry)/risk_orig,
+        'tp3': abs(tp3-entry)/risk_orig,
+    }
+    factors_json=json.dumps({'quant': a.get('factor_flags', {}), 'quant_score': a.get('score'),
+                              'gemini_zone_validated': bool(levels),
+                              'note': 'pending_limit -- zone confirmed by Gemini' if levels
+                                      else 'pending_limit -- no Gemini call'})
     with DB_LOCK:
-        con=db()
-        con.execute("UPDATE trades SET trade_type='LIMIT_QUANT' WHERE id=?",(tid,))
-        con.commit(); con.close()
+        con=db(); cur=con.execute('''INSERT INTO trades(symbol,direction,entry,sl,tp1,tp2,tp3,score,ai_confidence,ai_reason,framework,created_at,factors_json,effective_sl,pending_multipliers_json,status)
+                                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+          (a['symbol'],a['direction'],entry,sl,tp1,tp2,tp3,a['score'],0,
+           'Limit order watch -- Gemini-approved zone, SL/TP refined at fill from the real sweep candle' if levels
+           else 'Limit order watch -- SL/TP provisional, refined at fill from the real sweep candle',
+           FRAMEWORK,now_utc(),factors_json,sl,json.dumps(multipliers),'PENDING_LIMIT'))
+        con.execute("UPDATE trades SET trade_type=? WHERE id=?",
+                     ('LIMIT_GEMINI_ZONE' if levels else 'LIMIT_QUANT', cur.lastrowid))
+        con.commit(); tid=cur.lastrowid; con.close()
     return tid
 
 def track_pending_limits():
@@ -2998,7 +3144,7 @@ def stats():
         con.close()
     closed=[r for r in rows if r['status']=='CLOSED' and r.get('final_result')!='EXPIRED_NO_ENTRY']
     market=[r for r in closed if (r.get('trade_type') or 'MARKET_GEMINI')=='MARKET_GEMINI']
-    limit=[r for r in closed if r.get('trade_type')=='LIMIT_QUANT']
+    limit=[r for r in closed if r.get('trade_type') in ('LIMIT_QUANT','LIMIT_GEMINI_ZONE')]
     g=_group_stats(market)
     allg=_group_stats(closed)
     return {
@@ -3165,7 +3311,7 @@ def send_trade_summary():
 if not ENABLE_PENDING_LIMITS:
     PENDING_LIMIT_MIN_SCORE=101
 else:
-    PENDING_LIMIT_MIN_SCORE=max(0,int(os.getenv('PENDING_LIMIT_MIN_SCORE',str(MIN_SCORE))))
+    PENDING_LIMIT_MIN_SCORE=max(0,int(os.getenv('PENDING_LIMIT_MIN_SCORE','35')))
 
 # ----------------------------- Startup --------------------------------
 init_db()
