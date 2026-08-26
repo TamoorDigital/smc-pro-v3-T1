@@ -3099,21 +3099,29 @@ def track_pending_limits():
             if not filled:
                 continue
 
-            atr_c=fetch_klines(row['symbol'],TRACK_TIMEFRAME,30)
-            a_atr=atr(atr_c) if atr_c else abs(entry-row['sl'])*0.3
+            # Structural sweep/ATR at fill MUST come from the real 5M
+            # frame quant itself uses for sweep detection -- NOT
+            # TRACK_TIMEFRAME (1m), which is only meant for tight
+            # entry-price monitoring. Using 1m noise here was producing a
+            # near-zero "sweep" and a tiny 1m ATR, placing SL a few pips
+            # from entry and getting it hit almost immediately on fill.
+            struct_tf=TIMEFRAMES[2]
+            struct_c=fetch_klines(row['symbol'],struct_tf,30)
+            a_atr=atr(struct_c) if struct_c else abs(entry-row['sl'])*0.3
             try:
                 mult=json.loads(row['pending_multipliers_json'] or '{}')
             except Exception:
                 mult={}
             m1,m2,m3=mult.get('tp1',1.5),mult.get('tp2',2.3),mult.get('tp3',3.2)
             direction=row['direction']
+            sweep_src=struct_c[-3:] if struct_c else candles[-3:]
             if direction=='LONG':
-                sweep=min(x['low'] for x in candles[-3:])
+                sweep=min(x['low'] for x in sweep_src)
                 new_sl=min(sweep-0.3*a_atr,entry-0.6*a_atr)
                 risk=entry-new_sl
                 tps=(entry+m1*risk,entry+m2*risk,entry+m3*risk)
             else:
-                sweep=max(x['high'] for x in candles[-3:])
+                sweep=max(x['high'] for x in sweep_src)
                 new_sl=max(sweep+0.3*a_atr,entry+0.6*a_atr)
                 risk=new_sl-entry
                 tps=(entry-m1*risk,entry-m2*risk,entry-m3*risk)
