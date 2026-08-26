@@ -2505,7 +2505,11 @@ def _validate_and_correct_gemini_levels(best, ai):
         gemini_score=0.0
 
     approved=False; trade_plan=None
-    reason=ai.get('reason','Gemini rejected')
+    reason=ai.get('reason') or (
+        'Gemini response was truncated before a reason could be captured '
+        '(consider raising max_output_tokens if this repeats)'
+        if ai.get('_truncated_reject') else 'Gemini rejected (no reason given)'
+    )
     if str(ai.get('decision','REJECT')).upper()=='APPROVE' and gemini_score>=GEMINI_MIN_SCORE:
         positive,checked,agreement=structure_agreement(best.get('factor_flags',{}),ai)
         g_direction=str(ai.get('direction') or '').upper()
@@ -2609,7 +2613,7 @@ Return ONLY JSON:
  "order_block_detected":true/false,"fvg_detected":true/false,
  "reason":"brief evidence-based reason"
 }"""
-    return gemini_json(system,prompt,max_output_tokens=1200)
+    return gemini_json(system,prompt,max_output_tokens=2000)
 
 
 SL_STRUCTURE_TOLERANCE_ATR = max(0.1, float(os.getenv('SL_STRUCTURE_TOLERANCE_ATR', '1.5')))
@@ -2772,7 +2776,16 @@ def _validate_zone_entry(best, ai):
         gemini_score=float(ai.get('score',ai.get('confidence',0)) or 0)
     except (TypeError,ValueError):
         gemini_score=0.0
-    reason=ai.get('reason','Gemini rejected')
+    # ai.get('reason') can be genuinely absent when Gemini's response was
+    # truncated before it finished writing the reason string (see
+    # _parse_gemini_json_text's _truncated_reject fallback) -- say so
+    # honestly instead of the generic "Gemini rejected", which reads as
+    # if Gemini gave a considered answer with nothing more to add.
+    reason=ai.get('reason') or (
+        'Gemini response was truncated before a reason could be captured '
+        '(consider raising max_output_tokens if this repeats)'
+        if ai.get('_truncated_reject') else 'Gemini rejected (no reason given)'
+    )
     if str(ai.get('decision','REJECT')).upper()!='APPROVE' or gemini_score<GEMINI_MIN_SCORE:
         return False,None,reason,gemini_score
     g_direction=str(ai.get('direction') or '').upper()
@@ -2801,6 +2814,26 @@ def _try_zone_limit_order(a):
     symbol=a['symbol']; score=float(a.get('score',0))
     try:
         ai=gemini_validate_zone(a)
+    except RuntimeError as exc:
+        # A truncated/incomplete APPROVE already exhausted gemini_json()'s
+        # full multi-key fallback -- one more full attempt (fresh call,
+        # not a re-parse) before giving up on this cycle, since a single
+        # bad generation shouldn't cost the whole scan when the schema is
+        # this small.
+        log.warning('[GEMINI] zone check failed once for %s (%s), retrying once: %s',
+                    symbol, type(exc).__name__, exc)
+        try:
+            ai=gemini_validate_zone(a)
+        except Exception as exc2:
+            reason=f'Gemini zone error after retry: {type(exc2).__name__}: {exc2}'
+            with DB_LOCK:
+                con=db()
+                con.execute(
+                    'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason,htf_bias_score,trend_regime_score) VALUES(?,?,?,?,?,?,?,?)',
+                    (now_utc(),symbol,score,'ZONE_LIMIT_ERROR',1,reason,a.get('htf_bias_score'),a.get('trend_regime_score'))
+                )
+                con.commit(); con.close()
+            return 'ZONE_LIMIT_CHECK', f'limit-order zone check errored: {reason}'
     except Exception as exc:
         reason=f'Gemini zone error: {type(exc).__name__}: {exc}'
         with DB_LOCK:
