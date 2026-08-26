@@ -1205,7 +1205,7 @@ def has_open_similar(symbol,direction):
 # filtering at this stage comes from Gemini's independent zone judgment
 # (gemini_validate_zone), not the quant score alone.
 PENDING_LIMIT_MIN_SCORE = max(0, int(os.getenv('PENDING_LIMIT_MIN_SCORE', '53')))
-PENDING_LIMIT_TIMEOUT_MIN = max(0, int(os.getenv('PENDING_LIMIT_TIMEOUT_MIN', '150')))
+PENDING_LIMIT_TIMEOUT_MIN = max(0, int(os.getenv('PENDING_LIMIT_TIMEOUT_MIN', '240')))  # 4h
 
 def insert_pending_limit(a):
     """A limit-order 'watch' -- created as soon as a good-scoring setup
@@ -2005,7 +2005,7 @@ def dashboard():
 #  11) factor report is explicitly forward/observational; it cannot silently
 #      become a weight optimizer from tiny samples.
 
-ENABLE_PENDING_LIMITS = os.getenv('ENABLE_PENDING_LIMITS', '1').strip().lower() in ('1','true','yes','on')
+ENABLE_PENDING_LIMITS = os.getenv('ENABLE_PENDING_LIMITS', '0').strip().lower() in ('1','true','yes','on')
 MAX_GEMINI_CANDIDATES = max(1, int(os.getenv('MAX_GEMINI_CANDIDATES', '3')))
 MAX_CONCURRENT_TRADES = max(1, int(os.getenv('MAX_CONCURRENT_TRADES', '3')))
 
@@ -2291,36 +2291,77 @@ def build_analysis(symbol):
         htf_strength=_htf_bias_strength(a1,d,ema_ok)
         htf_ok=htf_strength>=HTF_BIAS_MIN_STRENGTH
         htf_strength_by_dir[d]=htf_strength
-        trend_ok=_trend_ratio>=TREND_REGIME_ATR_MULT
+        # Graded, same 0-1/threshold pattern as HTF bias: 1.0 ATR of
+        # EMA20/50 separation = full strength (still tunable via
+        # TREND_REGIME_ATR_MULT), pass/fail at TREND_REGIME_MIN_STRENGTH.
+        trend_strength=min(1.0,_trend_ratio/TREND_REGIME_ATR_MULT)
+        trend_ok=trend_strength>=TREND_REGIME_MIN_STRENGTH
         log.info('[HTF_BIAS] %s dir=%s strength=%.2f threshold=%.2f -> %s',
                   symbol, d, htf_strength, HTF_BIAS_MIN_STRENGTH, 'PASS' if htf_ok else 'fail')
+        log.info('[TREND_REGIME] %s dir=%s strength=%.2f threshold=%.2f -> %s',
+                  symbol, d, trend_strength, TREND_REGIME_MIN_STRENGTH, 'PASS' if trend_ok else 'fail')
 
         zone=detect_zone(c2,d)
         fvg=detect_fvg(c2,d)
         in_ob=bool(zone and zone['low']<=a3['price']<=zone['high'])
         in_fvg=bool(fvg and fvg['low']<=a3['price']<=fvg['high'])
         in_poi=in_ob or in_fvg
+        # Graded POI: order-block+FVG confluence scores higher than either
+        # alone, instead of a flat pass the moment price touches just one.
+        poi_strength=0.5*float(in_ob)+0.5*float(in_fvg)
 
         sweep=a3['bull_sweep'] if d=='LONG' else a3['bear_sweep']
+        sweep_level=a3['bull_sweep_level'] if d=='LONG' else a3['bear_sweep_level']
         bos=a3['bull_bos'] if d=='LONG' else a3['bear_bos']
+        swing_ref=a3['swing_highs'] if d=='LONG' else a3['swing_lows']
         choch=(detect_choch(c3,a3['bias'])['bull_choch'] if d=='LONG' else detect_choch(c3,a3['bias'])['bear_choch'])
         crt_bonus,_=tbs_crt_bonus(c3,d)
         mom=(a3['bull_mom'] if d=='LONG' else a3['bear_mom'])
         vol=a3['volume_ratio']>=1.1
         pbonus=build_pattern_score(detect_candlestick_patterns(c3),d)
 
+        atrv=max(a3['atr'],1e-9)
+        # Graded sweep: how far beyond the swept liquidity level the wick
+        # actually went, in ATR -- a barely-there sweep and a deep
+        # stop-hunt wick used to score the identical flat 12.
+        if sweep and sweep_level is not None:
+            depth=((sweep_level-min(x['low'] for x in c3[-3:])) if d=='LONG'
+                   else (max(x['high'] for x in c3[-3:])-sweep_level))/atrv
+            sweep_strength=min(1.0,max(0.0,depth)/0.5)
+        else:
+            sweep_strength=0.0
+        # Graded BOS: how far the close broke beyond the prior swing, ATR-normalized.
+        if bos and swing_ref:
+            ref_level=swing_ref[-1][1]
+            break_dist=((a3['price']-ref_level) if d=='LONG' else (ref_level-a3['price']))/atrv
+            bos_strength=min(1.0,max(0.0,break_dist)/0.3)
+        else:
+            bos_strength=0.0
+        choch_strength=1.0 if choch else 0.0  # binary event, no natural magnitude
+        crt_strength=crt_bonus/4.0            # tbs_crt_bonus returns 0 or 4
+        # Graded momentum+volume: smooth falloff from the RSI band center
+        # instead of a hard in/out cutoff, blended with how far volume
+        # exceeds 1.0x (proportional conviction, not just ">=1.1x yes/no").
+        rsi_center=62 if d=='LONG' else 38
+        rsi_strength=max(0.0,1-abs(a3['rsi']-rsi_center)/10)
+        vol_strength=min(1.0,max(0.0,a3['volume_ratio']-1.0))
+        momentum_strength=0.5*rsi_strength+0.5*vol_strength
+        pattern_strength=min(1.0,max(0.0,pbonus/4.0))
+
         # Grouped scoring: trend/EMA are one regime group; sweep+BOS are
         # separate trigger evidence; CRT/TBS one group; candle pattern is a
-        # tiebreaker only.
-        if htf_ok: scores[d]+=20; reasons[d].append('HTF structural bias aligned')
-        if trend_ok and ema_ok: scores[d]+=15; reasons[d].append('trend regime aligned')
-        if in_poi: scores[d]+=18; reasons[d].append('fresh 15M POI reached')
-        if sweep: scores[d]+=12; reasons[d].append('confirmed 5M liquidity sweep')
-        if bos: scores[d]+=12; reasons[d].append('confirmed 5M BOS')
-        if choch: scores[d]+=5; reasons[d].append('5M CHOCH/MSS')
-        if crt_bonus: scores[d]+=4; reasons[d].append('CRT/TBS confirmation')
-        if mom and vol: scores[d]+=5; reasons[d].append('momentum + volume confirmation')
-        if pbonus>0: scores[d]+=2; reasons[d].append('supportive candle pattern')
+        # tiebreaker only. All 9 factors are graded (0-1 strength x max
+        # points), not flat pass/fail -- a marginal pass and a clean
+        # textbook setup no longer score identically.
+        if htf_strength>0: scores[d]+=20*htf_strength; reasons[d].append(f'HTF bias {htf_strength:.0%}')
+        if trend_strength>0: scores[d]+=15*trend_strength; reasons[d].append(f'trend regime {trend_strength:.0%}')
+        if poi_strength>0: scores[d]+=18*poi_strength; reasons[d].append(f'15M POI {poi_strength:.0%}')
+        if sweep_strength>0: scores[d]+=12*sweep_strength; reasons[d].append(f'5M sweep {sweep_strength:.0%}')
+        if bos_strength>0: scores[d]+=12*bos_strength; reasons[d].append(f'5M BOS {bos_strength:.0%}')
+        if choch_strength>0: scores[d]+=5*choch_strength; reasons[d].append('5M CHOCH/MSS')
+        if crt_strength>0: scores[d]+=4*crt_strength; reasons[d].append(f'CRT/TBS {crt_strength:.0%}')
+        if momentum_strength>0: scores[d]+=5*momentum_strength; reasons[d].append(f'momentum+volume {momentum_strength:.0%}')
+        if pattern_strength>0: scores[d]+=2*pattern_strength; reasons[d].append('supportive candle pattern')
 
         flags_by_dir[d]={
             'htf_bias':htf_ok,
@@ -2403,7 +2444,7 @@ def build_analysis(symbol):
         'htf_bias_ok':bool(hard_htf),
         'trend_regime_ok':bool(hard_trend),
         'htf_bias_score':round(htf_strength_by_dir.get(direction,0.0),3) if direction else 0.0,
-        'trend_regime_score':round(_trend_ratio,3),
+        'trend_regime_score':round(min(1.0,_trend_ratio/TREND_REGIME_ATR_MULT),3),
         'zone_entry':None,
         'structure_levels':structure_levels,
     })
@@ -2518,20 +2559,24 @@ def _validate_and_correct_gemini_levels(best, ai):
 
 
 def gemini_validate_zone(analysis):
-    """Lighter, differently-framed Gemini call for the PRE-trigger zone
-    stage: price has just reached a 15M order-block/FVG (ZONE_REACHED),
-    but the 5M sweep/BOS/CHoCH hasn't happened yet -- there's no
-    confirmed trigger to describe. Ask a narrower question instead:
-    does this zone look like a genuine reaction point worth a resting
-    LIMIT order, given HTF bias/trend and the zone's own structure?
-    Same JSON response schema as gemini_validate() so the SAME
-    downstream approval/structure/SL pipeline (_validate_and_correct_
-    gemini_levels) works unchanged for this path too."""
+    """Entry-ONLY Gemini call for setups whose score hasn't reached
+    MIN_SCORE yet (hard filters -- bias+trend -- already passed). This is
+    NOT gated on quant's own detect_zone()/detect_fvg() having fired --
+    Gemini judges directly from raw candles whether an order block or FVG
+    is forming here at all, independent of the quant detector.
+    Deliberately asks for ENTRY ONLY, not SL/TP: if approved, the limit
+    order just rests at that entry and SL/TP are computed later from the
+    REAL reaction candle once price actually fills (see
+    track_pending_limits()) -- guessing SL/TP now, before any reaction
+    has happened, would be arbitrary."""
     prompt={
-        'task':('Price has just reached a 15M order block / FVG zone. No 5M sweep, '
-                'BOS, or CHOCH has been confirmed yet -- do not claim one has. '
-                'Independently judge whether this zone is a genuine reaction point '
-                'worth a resting LIMIT order, using ONLY the raw OHLCV supplied.'),
+        'task':('Hard filters (HTF bias + trend regime) have passed, but the setup has '
+                'not fully triggered -- no confirmed 5M sweep/BOS/CHOCH yet, and no '
+                'claim is made here that quant\'s own zone detector found anything. '
+                'Using ONLY the raw OHLCV supplied, independently judge: is an order '
+                'block or FVG forming here that is worth a resting LIMIT order? If so, '
+                'at what precise entry price (at or very near that zone\'s edge, not '
+                'chasing current price)?'),
         'symbol':analysis['symbol'],
         'framework':analysis['framework'],
         'timeframes':analysis['timeframes'],
@@ -2547,35 +2592,34 @@ def gemini_validate_zone(analysis):
     }
     system="""You are an independent second analyst for a crypto trading research bot.
 Use ONLY the supplied raw OHLCV candles and derived neutral market data.
-Do NOT receive or use a quant score, quant direction, quant Entry/SL/TP, or quant reasons.
-This is a PRE-trigger check: price has reached a 15M order block/FVG zone, but no
-5M sweep/BOS/CHOCH has happened yet. Judge the zone itself: is it a real, clean
-structural level (not mid-range, not already violated), does HTF bias/trend support
-a reaction from here, and would a LIMIT order resting at this zone (not chasing
-price) make sense? Propose an entry AT or very near the zone edge, an invalidation
-stop just beyond the real structure on the other side, and TP1/TP2/TP3 with TP2 at
-least 2R. If the zone looks weak, already mitigated, or unsupported by HTF
-bias/trend, REJECT.
+Do NOT receive or use a quant score, quant direction, or quant Entry/SL/TP.
+This is an ENTRY-ONLY check, not a full trade: hard filters (bias+trend) already
+passed, but no 5M sweep/BOS/CHOCH has been confirmed yet. Look directly at the raw
+candles and judge whether a real order block or FVG is forming -- a clean structural
+level, not mid-range, not already violated/mitigated -- that is worth a resting LIMIT
+order. Do NOT propose SL or TP; those get set later from the actual reaction once
+price fills. If nothing worth watching is forming, REJECT.
 Return ONLY JSON:
 {
  "decision":"APPROVE|REJECT",
  "direction":"LONG|SHORT",
  "score":0-100,
  "confidence":0-100,
- "entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,
- "bos_detected":true/false,"choch_detected":true/false,
+ "entry":number,
  "order_block_detected":true/false,"fvg_detected":true/false,
- "crt_detected":true/false,"tbs_detected":true/false,
  "reason":"brief evidence-based reason"
 }"""
-    return gemini_json(system,prompt,max_output_tokens=1800)
+    return gemini_json(system,prompt,max_output_tokens=1200)
 
 
 SL_STRUCTURE_TOLERANCE_ATR = max(0.1, float(os.getenv('SL_STRUCTURE_TOLERANCE_ATR', '1.5')))
 # How much EMA20/EMA50 must separate (in ATR units, 1h) before trend_regime
 # counts as aligned. Diagnostic logging below reports the real ratio every
 # scan so this can be tuned from observed numbers instead of guessing.
-TREND_REGIME_ATR_MULT = max(0.05, float(os.getenv('TREND_REGIME_ATR_MULT', '0.6')))
+TREND_REGIME_ATR_MULT = max(0.05, float(os.getenv('TREND_REGIME_ATR_MULT', '1.0')))
+# Graded pass/fail threshold (0-1) applied to trend_strength=min(1.0,
+# ratio/TREND_REGIME_ATR_MULT) -- same style as HTF_BIAS_MIN_STRENGTH.
+TREND_REGIME_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('TREND_REGIME_MIN_STRENGTH', '0.6'))))
 # Graded (0-1) version of the HTF bias check instead of the old strict
 # all-4-conditions AND. Mirrors TREND_REGIME_ATR_MULT's ratio+threshold
 # pattern -- see _htf_bias_strength() for what the 4 components are.
@@ -2715,13 +2759,44 @@ def _final_level_check(direction, entry, sl, tp1, tp2, tp3):
     return True,'OK'
 
 # ---------------- Watch-state / scan execution ----------------
+def _validate_zone_entry(best, ai):
+    """Lightweight APPROVE/REJECT for the entry-only zone-limit path.
+    Gemini here proposes ONLY an entry level -- no SL/TP -- so this does
+    NOT run the full _validate_and_correct_gemini_levels structural/SL
+    pipeline (there's no SL yet to verify). Just checks decision,
+    direction agreement with quant, and that a sane entry number came
+    back. Real SL/TP get set later at fill time from the actual reaction
+    (see track_pending_limits()). Returns (approved, entry, reason, gemini_score).
+    """
+    try:
+        gemini_score=float(ai.get('score',ai.get('confidence',0)) or 0)
+    except (TypeError,ValueError):
+        gemini_score=0.0
+    reason=ai.get('reason','Gemini rejected')
+    if str(ai.get('decision','REJECT')).upper()!='APPROVE' or gemini_score<GEMINI_MIN_SCORE:
+        return False,None,reason,gemini_score
+    g_direction=str(ai.get('direction') or '').upper()
+    if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
+        return False,None,'Gemini direction disagrees with quant direction',gemini_score
+    try:
+        entry=float(ai['entry'])
+    except (KeyError,TypeError,ValueError):
+        return False,None,'Gemini approval missing a valid entry level',gemini_score
+    if entry<=0:
+        return False,None,'Gemini entry level invalid',gemini_score
+    return True,entry,reason,gemini_score
+
+
 def _try_zone_limit_order(a):
-    """Called once per scan cycle a candidate is freshly ZONE_REACHED and
-    scores >= PENDING_LIMIT_MIN_SCORE. Gets an independent Gemini read on
-    the zone itself (no trigger has happened yet), runs it through the
-    SAME approval/structure/SL pipeline as the full-trigger path, and
-    places a resting limit order at the zone if approved. Returns
-    (status, note) for the caller's watch-state log line.
+    """Called each scan cycle a candidate has passed hard filters
+    (bias+trend) but hasn't reached MIN_SCORE yet. Asks Gemini directly
+    from raw candles whether an order block/FVG worth a resting limit
+    order is forming -- NOT gated on quant's own zone detector. Gemini
+    confirms ONLY the entry level (see gemini_validate_zone /
+    _validate_zone_entry); SL/TP are intentionally left for fill time,
+    when track_pending_limits() computes them from the REAL reaction
+    candle (e.g. SL just below the actual sweep low) rather than a
+    pre-fill guess. Returns (status, note) for the caller's scan-log line.
     """
     symbol=a['symbol']; score=float(a.get('score',0))
     try:
@@ -2735,9 +2810,9 @@ def _try_zone_limit_order(a):
                 (now_utc(),symbol,score,'ZONE_LIMIT_ERROR',1,reason,a.get('htf_bias_score'),a.get('trend_regime_score'))
             )
             con.commit(); con.close()
-        return 'ZONE_REACHED', f'limit-order zone check errored: {reason}'
+        return 'ZONE_LIMIT_CHECK', f'limit-order zone check errored: {reason}'
 
-    approved,trade_plan,reason,gemini_score=_validate_and_correct_gemini_levels(a,ai)
+    approved,entry,reason,gemini_score=_validate_zone_entry(a,ai)
     decision='ZONE_LIMIT_APPROVED' if approved else 'ZONE_LIMIT_REJECTED'
     with DB_LOCK:
         con=db()
@@ -2749,18 +2824,22 @@ def _try_zone_limit_order(a):
         con.commit(); con.close()
 
     if not approved:
-        return 'ZONE_REACHED', f'limit order not placed: {reason}'
+        return 'ZONE_LIMIT_CHECK', f'limit order not placed: {reason}'
 
-    pid=insert_pending_limit(a, levels=trade_plan)
+    # Entry only -- SL/TP fall back to quant's own a[\'sl\']/a[\'tp1/2/3\']
+    # purely as a provisional DB-constraint placeholder. They get FULLY
+    # overwritten at fill time by track_pending_limits() from the real
+    # reaction candle, never sent out or acted on as-is.
+    pid=insert_pending_limit(a, levels={'entry':entry})
     if pid is None:
-        return 'ZONE_REACHED', 'Gemini approved the zone but ENABLE_PENDING_LIMITS is off'
+        return 'ZONE_LIMIT_CHECK', 'Gemini approved the zone but ENABLE_PENDING_LIMITS is off'
     telegram_send(
-        f'\U0001F440 *LIMIT ORDER PLACED (Gemini-approved zone) \u2014 {symbol} {trade_plan["direction"]}*\n'
-        f'Trade #{pid}\nWatching for fill at `{fmt_price(trade_plan["entry"])}`\n'
+        f'\U0001F440 *LIMIT ORDER PLACED \u2014 {symbol} {a["direction"]}*\n'
+        f'Trade #{pid}\nWatching for fill at `{fmt_price(entry)}`\n'
         f'Quant Score: `{score:.0f}/100` | Gemini Score: `{gemini_score:.0f}/100`\n'
-        f'SL `{fmt_price(trade_plan["sl"])}` will be refined from the real sweep candle once filled.'
+        f'SL/TP will be set from the real reaction candle once filled.'
     )
-    return 'ZONE_REACHED', f'limit order placed at zone (Gemini-approved, id={pid})'
+    return 'ZONE_LIMIT_CHECK', f'limit order placed at zone (Gemini-approved entry, id={pid})'
 
 
 def scan_once(force=False):
@@ -2795,25 +2874,27 @@ def scan_once(force=False):
         eligible=[a for a in analyses if a.get('direction') in ('LONG','SHORT')
                   and a.get('htf_bias_ok') and a.get('trend_regime_ok')]
 
+        # No multi-scan waiting/state-tracking: each scan decides for
+        # itself, from that scan's own fresh candles. Hard filters already
+        # passed (bias+trend) to be in `eligible` at all.
+        #   score >= MIN_SCORE  -> full setup this cycle -> trigger path
+        #   score <  MIN_SCORE  -> ask Gemini directly (raw candles) if a
+        #                          zone worth a resting limit order is
+        #                          forming here -- NOT gated on quant's own
+        #                          zone detector, Gemini judges from raw data
         watch_notes={}
         triggered=[]
-        if WATCH_STATE_ENABLED:
-            for a in eligible:
-                status,note=update_watch_state(a)
-                watch_notes[a['symbol']]=(status,note)
-                if status=='TRIGGERED':
-                    triggered.append(a)
-                elif (status=='ZONE_REACHED' and ENABLE_PENDING_LIMITS
-                      and float(a.get('score',0))>=PENDING_LIMIT_MIN_SCORE
-                      and not has_open_similar(a['symbol'],a['direction'])):
-                    # Good-scoring setup has reached its zone but hasn't
-                    # triggered yet -- get Gemini's independent read on the
-                    # ZONE ITSELF (not a claimed trigger) and place a
-                    # resting limit order there if approved, instead of
-                    # waiting out the full sweep/BOS confirmation.
-                    watch_notes[a['symbol']]=_try_zone_limit_order(a)
-        else:
-            triggered=list(eligible)
+        for a in eligible:
+            if has_open_similar(a['symbol'],a['direction']):
+                watch_notes[a['symbol']]=('SKIPPED','similar trade already open/pending')
+                continue
+            if float(a.get('score',0))>=MIN_SCORE:
+                triggered.append(a)
+                watch_notes[a['symbol']]=('READY','full setup this cycle')
+            elif ENABLE_PENDING_LIMITS:
+                watch_notes[a['symbol']]=_try_zone_limit_order(a)
+            else:
+                watch_notes[a['symbol']]=('BELOW_MIN_SCORE','score below MIN_SCORE, pending-limit path disabled')
 
         candidates=triggered
         candidates.sort(key=lambda x:float(x.get('score',0)),reverse=True)
@@ -2834,7 +2915,7 @@ def scan_once(force=False):
                     reason='Failed: '+', '.join(missing)
                 else:
                     status,note=watch_notes.get(a['symbol'],('ELIGIBLE','eligible'))
-                    decision=f'WATCHING_{status}' if WATCH_STATE_ENABLED else 'ELIGIBLE'
+                    decision=f'WATCHING_{status}'
                     reason=note
                 con.execute(
                     'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason,htf_bias_score,trend_regime_score) VALUES(?,?,?,?,?,?,?,?)',
@@ -2970,6 +3051,11 @@ def track_pending_limits():
                             "UPDATE trades SET status='CLOSED',final_result='EXPIRED_NO_ENTRY',close_time=? WHERE id=?",
                             (now_utc(),row['id'])
                         ); con.commit(); con.close()
+                    telegram_send(
+                        f'\u231B *LIMIT ORDER EXPIRED \u2014 {row["symbol"]} {row["direction"]}*\n'
+                        f'Trade #{row["id"]}\nZone `{fmt_price(row["entry"])}` never filled within '
+                        f'{PENDING_LIMIT_TIMEOUT_MIN}min -- cancelled.'
+                    )
                     continue
             candles=fetch_tracking_candle(row['symbol'],6)
             if not candles:
@@ -3026,6 +3112,14 @@ def track_pending_limits():
                 sql=', '.join(f'{k}=?' for k in sets)
                 con.execute(f'UPDATE trades SET {sql} WHERE id=?',list(sets.values())+[row['id']])
                 con.commit(); con.close()
+
+            telegram_send(
+                f'\U0001F3AF *LIMIT ORDER FILLED \u2014 {row["symbol"]} {direction}*\n'
+                f'Trade #{row["id"]}\n'
+                f'Entry: `{fmt_price(entry)}`\n'
+                f'SL: `{fmt_price(new_sl)}` (set from the real sweep candle)\n'
+                f'TP1: `{fmt_price(tps[0])}` | TP2: `{fmt_price(tps[1])}` | TP3: `{fmt_price(tps[2])}`'
+            )
         except Exception as e:
             log.warning('pending-limit tracker %s: %s',row['symbol'],e)
 
@@ -3311,7 +3405,7 @@ def send_trade_summary():
 if not ENABLE_PENDING_LIMITS:
     PENDING_LIMIT_MIN_SCORE=101
 else:
-    PENDING_LIMIT_MIN_SCORE=max(0,int(os.getenv('PENDING_LIMIT_MIN_SCORE','35')))
+    PENDING_LIMIT_MIN_SCORE=max(0,int(os.getenv('PENDING_LIMIT_MIN_SCORE','53')))
 
 # ----------------------------- Startup --------------------------------
 init_db()
