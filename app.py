@@ -178,7 +178,18 @@ TRACK_INTERVAL = max(1, int(os.getenv('TRACK_INTERVAL_MINUTES', '1')))
 TRACK_TIMEFRAME = os.getenv('TRACK_TIMEFRAME', '1m')
 MIN_SCORE = max(0, min(100, int(os.getenv('MIN_SCORE', '70'))))
 GEMINI_MIN_SCORE = max(0, min(100, int(os.getenv('GEMINI_MIN_SCORE', '65'))))
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+# Model fallback: tried model-major, key-minor -- ALL 5 keys are tried on
+# model[0] before moving to model[1], etc. (not the other way round). This
+# is what actually helps with daily rate-limit exhaustion: each model has
+# its OWN separate quota, so falling back to a different model after all
+# keys are rate-limited on the current one unlocks fresh quota, instead of
+# just cycling through keys that are all capped on the same model.
+_DEFAULT_GEMINI_MODELS = 'gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash'
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.7-flash')
+GEMINI_MODELS = [m.strip() for m in os.getenv('GEMINI_MODELS', _DEFAULT_GEMINI_MODELS).split(',') if m.strip()]
+if GEMINI_MODEL in GEMINI_MODELS:
+    GEMINI_MODELS.remove(GEMINI_MODEL)
+GEMINI_MODELS = [GEMINI_MODEL] + GEMINI_MODELS
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 # Five-project fallback. GEMINI_API_KEY remains backward compatible as project 1.
 GEMINI_API_KEYS = [
@@ -1063,10 +1074,13 @@ def _parse_gemini_json_text(txt):
 
 
 def gemini_json(system_text, user_payload, max_output_tokens=2500):
-    """Call Gemini with 5-key fallback. Normal REJECT is a final decision.
+    """Call Gemini with model-major, key-minor fallback: ALL keys are
+    tried on the current model before moving to the next model (see
+    GEMINI_MODELS). Normal REJECT is a final decision.
 
-    Fallback occurs ONLY for transport/API/configuration failures or incomplete
-    non-decision responses. A parsed Gemini REJECT immediately stops the chain.
+    Fallback occurs ONLY for transport/API/configuration failures or
+    incomplete non-decision responses. A parsed Gemini REJECT immediately
+    stops the whole chain (model and key loops both).
     """
     global GEMINI_LAST_CALL
     if not GEMINI_API_KEYS:
@@ -1076,44 +1090,51 @@ def gemini_json(system_text, user_payload, max_output_tokens=2500):
           'generationConfig':{'temperature':0.1,'maxOutputTokens':max_output_tokens,
                               'responseMimeType':'application/json'}}
     last_error=None
-    for idx,key in enumerate(GEMINI_API_KEYS,1):
-        try:
-            with GEMINI_LOCK:
-                wait=GEMINI_MIN_INTERVAL-(time.monotonic()-GEMINI_LAST_CALL)
-                if wait>0: time.sleep(wait)
-                url=f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
-                log.info('[GEMINI] CALL project=%d/%d model=%s symbol=%s',idx,len(GEMINI_API_KEYS),GEMINI_MODEL,user_payload.get('symbol','?'))
-                r=requests.post(url,params={'key':key},json=body,timeout=GEMINI_TIMEOUT)
-                GEMINI_LAST_CALL=time.monotonic()
-            if r.status_code==429:
-                last_error=RuntimeError(f'Gemini 429 RESOURCE_EXHAUSTED project={idx}: {r.text[:700]}')
-                log.warning('[GEMINI] FALLBACK project=%d/%d HTTP=429',idx,len(GEMINI_API_KEYS)); continue
-            if r.status_code in (408,409,500,502,503,504):
-                last_error=RuntimeError(f'Gemini HTTP {r.status_code} project={idx}: {r.text[:700]}')
-                log.warning('[GEMINI] FALLBACK project=%d/%d HTTP=%d',idx,len(GEMINI_API_KEYS),r.status_code); continue
-            if r.status_code in (400,401,403):
-                last_error=RuntimeError(f'Gemini HTTP {r.status_code} project={idx}: {r.text[:700]}')
-                log.warning('[GEMINI] FALLBACK project=%d/%d HTTP=%d',idx,len(GEMINI_API_KEYS),r.status_code); continue
-            r.raise_for_status()
-            data=r.json()
-            txt=data['candidates'][0]['content']['parts'][0]['text'].strip()
-            parsed=_parse_gemini_json_text(txt)
-            # CRITICAL: a normal REJECT is a valid final answer. Never fallback.
-            if str(parsed.get('decision','')).upper()=='REJECT':
-                log.info('[GEMINI] FINAL REJECT project=%d/%d symbol=%s',idx,len(GEMINI_API_KEYS),user_payload.get('symbol','?'))
-                return parsed
-            # APPROVE must be fully valid JSON and therefore reaches here only safely.
-            if str(parsed.get('decision','')).upper()=='APPROVE':
-                log.info('[GEMINI] FINAL APPROVE project=%d/%d symbol=%s',idx,len(GEMINI_API_KEYS),user_payload.get('symbol','?'))
-                return parsed
-            raise RuntimeError('Gemini response missing valid decision')
-        except (requests.RequestException, KeyError, ValueError, RuntimeError) as exc:
-            last_error=exc
-            # If the parser identified a safe REJECT, it is returned above and
-            # never enters this fallback path.
-            log.warning('[GEMINI] FALLBACK project=%d/%d response error=%s',idx,len(GEMINI_API_KEYS),exc)
-            continue
-    raise last_error or RuntimeError('All configured Gemini projects failed')
+    total_attempts=len(GEMINI_MODELS)*len(GEMINI_API_KEYS)
+    attempt=0
+    for model in GEMINI_MODELS:
+        for idx,key in enumerate(GEMINI_API_KEYS,1):
+            attempt+=1
+            try:
+                with GEMINI_LOCK:
+                    wait=GEMINI_MIN_INTERVAL-(time.monotonic()-GEMINI_LAST_CALL)
+                    if wait>0: time.sleep(wait)
+                    url=f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+                    log.info('[GEMINI] CALL %d/%d model=%s project=%d/%d symbol=%s',
+                              attempt,total_attempts,model,idx,len(GEMINI_API_KEYS),user_payload.get('symbol','?'))
+                    r=requests.post(url,params={'key':key},json=body,timeout=GEMINI_TIMEOUT)
+                    GEMINI_LAST_CALL=time.monotonic()
+                if r.status_code==429:
+                    last_error=RuntimeError(f'Gemini 429 RESOURCE_EXHAUSTED model={model} project={idx}: {r.text[:700]}')
+                    log.warning('[GEMINI] FALLBACK %d/%d model=%s project=%d/%d HTTP=429',
+                                attempt,total_attempts,model,idx,len(GEMINI_API_KEYS)); continue
+                if r.status_code in (408,409,500,502,503,504):
+                    last_error=RuntimeError(f'Gemini HTTP {r.status_code} model={model} project={idx}: {r.text[:700]}')
+                    log.warning('[GEMINI] FALLBACK %d/%d model=%s project=%d/%d HTTP=%d',
+                                attempt,total_attempts,model,idx,len(GEMINI_API_KEYS),r.status_code); continue
+                if r.status_code in (400,401,403,404):
+                    last_error=RuntimeError(f'Gemini HTTP {r.status_code} model={model} project={idx}: {r.text[:700]}')
+                    log.warning('[GEMINI] FALLBACK %d/%d model=%s project=%d/%d HTTP=%d',
+                                attempt,total_attempts,model,idx,len(GEMINI_API_KEYS),r.status_code); continue
+                r.raise_for_status()
+                data=r.json()
+                txt=data['candidates'][0]['content']['parts'][0]['text'].strip()
+                parsed=_parse_gemini_json_text(txt)
+                if str(parsed.get('decision','')).upper()=='REJECT':
+                    log.info('[GEMINI] FINAL REJECT %d/%d model=%s project=%d/%d symbol=%s',
+                              attempt,total_attempts,model,idx,len(GEMINI_API_KEYS),user_payload.get('symbol','?'))
+                    return parsed
+                if str(parsed.get('decision','')).upper()=='APPROVE':
+                    log.info('[GEMINI] FINAL APPROVE %d/%d model=%s project=%d/%d symbol=%s',
+                              attempt,total_attempts,model,idx,len(GEMINI_API_KEYS),user_payload.get('symbol','?'))
+                    return parsed
+                raise RuntimeError('Gemini response missing valid decision')
+            except (requests.RequestException, KeyError, ValueError, RuntimeError) as exc:
+                last_error=exc
+                log.warning('[GEMINI] FALLBACK %d/%d model=%s project=%d/%d response error=%s',
+                            attempt,total_attempts,model,idx,len(GEMINI_API_KEYS),exc)
+                continue
+    raise last_error or RuntimeError('All configured Gemini models/projects failed')
 
 def gemini_validate(analysis):
     prompt={
