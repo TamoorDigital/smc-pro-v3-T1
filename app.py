@@ -154,7 +154,7 @@ def build_pattern_score(patterns, direction):
     if direction == "LONG":
         return min(4, 2 * len(set(patterns) & bullish)) - min(2, len(set(patterns) & bearish))
     return min(4, 2 * len(set(patterns) & bearish)) - min(2, len(set(patterns) & bullish))
-import os, re, json, time, math, sqlite3, threading, logging
+import os, re, json, time, math, random, sqlite3, threading, logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -499,18 +499,35 @@ def _fetch_mexc(symbol, interval, limit):
 def fetch_klines(symbol, interval, limit=150):
     errors=[]
     for exchange in EXCHANGE_ORDER:
-        try:
-            if exchange == 'binance': rows=_fetch_binance(symbol,interval,limit)
-            elif exchange == 'bybit': rows=_fetch_bybit(symbol,interval,limit)
-            elif exchange == 'mexc': rows=_fetch_mexc(symbol,interval,limit)
-            else: continue
-            if len(rows) >= min(limit,3):
-                if exchange != EXCHANGE_ORDER[0]: log.warning('[%s %s] market-data fallback -> %s', symbol, interval, exchange)
-                return rows
-            errors.append(f'{exchange}: insufficient candles ({len(rows)})')
-        except Exception as exc:
-            errors.append(f'{exchange}: {type(exc).__name__}: {exc}')
-            log.warning('[%s %s] %s failed: %s', symbol, interval, exchange, exc)
+        fn={'binance':_fetch_binance,'bybit':_fetch_bybit,'mexc':_fetch_mexc}.get(exchange)
+        if fn is None:
+            continue
+        # A 429 ("too many requests") is usually transient -- back off
+        # briefly and retry the SAME exchange once before giving up on it
+        # and falling through to the next one. This avoids needlessly
+        # burning through the whole exchange chain (and getting rate-limited
+        # on all of them in a burst) for what's often a one-off spike.
+        for attempt in (1,2):
+            try:
+                rows=fn(symbol,interval,limit)
+                if len(rows) >= min(limit,3):
+                    if exchange != EXCHANGE_ORDER[0]: log.warning('[%s %s] market-data fallback -> %s', symbol, interval, exchange)
+                    return rows
+                errors.append(f'{exchange}: insufficient candles ({len(rows)})')
+                break
+            except requests.exceptions.HTTPError as exc:
+                status=exc.response.status_code if exc.response is not None else None
+                if status==429 and attempt==1:
+                    delay=0.6+random.uniform(0,0.6)
+                    log.warning('[%s %s] %s rate-limited (429), retrying once in %.1fs', symbol, interval, exchange, delay)
+                    time.sleep(delay); continue
+                errors.append(f'{exchange}: HTTP {status}: {exc}')
+                log.warning('[%s %s] %s failed: %s', symbol, interval, exchange, exc)
+                break
+            except Exception as exc:
+                errors.append(f'{exchange}: {type(exc).__name__}: {exc}')
+                log.warning('[%s %s] %s failed: %s', symbol, interval, exchange, exc)
+                break
     raise RuntimeError(f'All market-data sources failed for {symbol} {interval}: ' + ' | '.join(errors))
 
 # ----------------------------- Indicators -----------------------------
@@ -2595,13 +2612,23 @@ def gemini_validate_zone(analysis):
     track_pending_limits()) -- guessing SL/TP now, before any reaction
     has happened, would be arbitrary."""
     prompt={
-        'task':('Hard filters (HTF bias + trend regime) have passed, but the setup has '
-                'not fully triggered -- no confirmed 5M sweep/BOS/CHOCH yet, and no '
-                'claim is made here that quant\'s own zone detector found anything. '
-                'Using ONLY the raw OHLCV supplied, independently judge: is an order '
-                'block or FVG forming here that is worth a resting LIMIT order? If so, '
-                'at what precise entry price (at or very near that zone\'s edge, not '
-                'chasing current price)?'),
+        'task':('Hard filters (1H HTF bias + trend regime) have already passed, but the '
+                'setup has not fully triggered -- no confirmed 5M sweep/BOS/CHOCH yet, and '
+                'no claim is made here that quant\'s own zone detector found anything. '
+                'Follow this exact sequence using ONLY the raw OHLCV supplied:\n'
+                '1) 15M: scan the 15M candles for the NEXT order block or FVG forming in the '
+                'direction the 1H bias/trend supports -- a LONG zone must sit at/near real '
+                'support (a prior demand zone, swing low, or untested OB/FVG below current '
+                'price); a SHORT zone must sit at/near real resistance (prior supply, swing '
+                'high, untested OB/FVG above current price). Reject if nothing structurally '
+                'clean is forming, or if the only candidate zone is already mid-range with no '
+                'S/R confluence.\n'
+                '2) 5M: before finalizing, check the 5M candles for any recent change of '
+                'character (CHOCH) or shift in trend AGAINST the intended direction -- if 5M '
+                'structure is already breaking the opposite way, REJECT even if the 15M zone '
+                'looks clean, since the reaction may already be over or reversing.\n'
+                '3) Only if both checks pass, propose a precise entry AT or very near the '
+                '15M zone\'s edge (not chasing current price, not mid-zone).'),
         'symbol':analysis['symbol'],
         'framework':analysis['framework'],
         'timeframes':analysis['timeframes'],
@@ -2618,12 +2645,19 @@ def gemini_validate_zone(analysis):
     system="""You are an independent second analyst for a crypto trading research bot.
 Use ONLY the supplied raw OHLCV candles and derived neutral market data.
 Do NOT receive or use a quant score, quant direction, or quant Entry/SL/TP.
-This is an ENTRY-ONLY check, not a full trade: hard filters (bias+trend) already
-passed, but no 5M sweep/BOS/CHOCH has been confirmed yet. Look directly at the raw
-candles and judge whether a real order block or FVG is forming -- a clean structural
-level, not mid-range, not already violated/mitigated -- that is worth a resting LIMIT
-order. Do NOT propose SL or TP; those get set later from the actual reaction once
-price fills. If nothing worth watching is forming, REJECT.
+This is an ENTRY-ONLY check, not a full trade: hard filters (1H bias+trend) already
+passed, but no 5M sweep/BOS/CHOCH has been confirmed yet.
+
+Follow the sequence given in the task field precisely:
+1) 15M -- find the next real order block/FVG in the supported direction, requiring
+   support/resistance confluence (not a random mid-range zone).
+2) 5M -- check for a change of character or trend shift AGAINST the intended
+   direction; if the 5M is already turning the other way, REJECT regardless of how
+   clean the 15M zone looks.
+3) Only then propose an entry at/near the zone edge.
+
+Do NOT propose SL or TP; those get set later from the actual reaction once price
+fills. If nothing worth watching is forming, or step 2 fails, REJECT.
 Return ONLY JSON:
 {
  "decision":"APPROVE|REJECT",
@@ -2632,6 +2666,8 @@ Return ONLY JSON:
  "confidence":0-100,
  "entry":number,
  "order_block_detected":true/false,"fvg_detected":true/false,
+ "support_resistance_confluence":true/false,
+ "choch_against_direction":true/false,
  "reason":"brief evidence-based reason"
 }"""
     return gemini_json(system,prompt,max_output_tokens=2000)
@@ -2809,6 +2845,12 @@ def _validate_zone_entry(best, ai):
     )
     if str(ai.get('decision','REJECT')).upper()!='APPROVE' or gemini_score<GEMINI_MIN_SCORE:
         return False,None,reason,gemini_score
+    if ai.get('choch_against_direction'):
+        # Defense in depth: even if Gemini's own decision logic slipped
+        # and said APPROVE, a self-reported change-of-character against
+        # the intended direction means the 5M reaction may already be
+        # over or reversing -- do not place a resting limit order into that.
+        return False,None,'Gemini flagged a 5M change of character against the intended direction',gemini_score
     g_direction=str(ai.get('direction') or '').upper()
     if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
         return False,None,'Gemini direction disagrees with quant direction',gemini_score
@@ -3067,13 +3109,29 @@ def insert_pending_limit(a, levels=None):
         return None
     lv=levels or {}
     entry=lv.get('entry') or a.get('zone_entry') or a.get('entry')
+    # `sl`/`tp1-3` here are ONLY a provisional DB-constraint placeholder
+    # (NOT NULL columns) -- they get FULLY overwritten at fill from real
+    # fill-time structure. NEVER derive R-multipliers from them: quant's
+    # own sl/tp1-3 are anchored to quant's OWN entry price (a['entry'],
+    # the current price when it scanned), which can be a materially
+    # different number from Gemini's zone `entry` here. Computing
+    # abs(quant_tp - gemini_entry)/abs(gemini_entry - quant_sl) mixes two
+    # unrelated reference points and produces a distorted, sometimes wild
+    # ratio (this was producing multi-thousand-point "boring" TPs that
+    # bore no relation to the real fill-time risk). When only `entry` is
+    # supplied (the zone-limit path), leave multipliers empty so
+    # track_pending_limits() uses its own safe defaults (1.5/2.3/3.2R)
+    # applied to the REAL risk computed at fill time.
     sl=lv.get('sl', a.get('sl')); tp1=lv.get('tp1', a.get('tp1')); tp2=lv.get('tp2', a.get('tp2')); tp3=lv.get('tp3', a.get('tp3'))
-    risk_orig=abs(entry-sl) or 1e-9
-    multipliers={
-        'tp1': abs(tp1-entry)/risk_orig,
-        'tp2': abs(tp2-entry)/risk_orig,
-        'tp3': abs(tp3-entry)/risk_orig,
-    }
+    if all(k in lv for k in ('sl','tp1','tp2','tp3')):
+        risk_orig=abs(entry-lv['sl']) or 1e-9
+        multipliers={
+            'tp1': abs(lv['tp1']-entry)/risk_orig,
+            'tp2': abs(lv['tp2']-entry)/risk_orig,
+            'tp3': abs(lv['tp3']-entry)/risk_orig,
+        }
+    else:
+        multipliers={}
     factors_json=json.dumps({'quant': a.get('factor_flags', {}), 'quant_score': a.get('score'),
                               'structure_levels': a.get('structure_levels', {}),
                               'gemini_zone_validated': bool(levels),
@@ -3090,6 +3148,40 @@ def insert_pending_limit(a, levels=None):
                      ('LIMIT_GEMINI_ZONE' if levels else 'LIMIT_QUANT', cur.lastrowid))
         con.commit(); tid=cur.lastrowid; con.close()
     return tid
+
+def _check_zone_retest(symbol, direction, entry, zone_low, zone_high):
+    """Checks the most recent CLOSED 5M candle for a genuine RETEST of the
+    15M zone noted when this limit order was approved -- price must have
+    wicked into the zone AND closed back on the correct side (a real
+    rejection), not just mechanically touched the entry price. Same
+    sweep-confirmation shape used elsewhere in this file (wick beyond a
+    level, close back through it), applied here to the specific zone that
+    justified this order.
+    Returns (confirmed: bool, retest_candle: dict|None).
+    """
+    struct_tf=TIMEFRAMES[2]
+    try:
+        c5=fetch_klines(symbol,struct_tf,10)
+    except Exception:
+        return False,None
+    closed=[x for x in c5 if _candle_is_closed(x,struct_tf)]
+    if not closed:
+        return False,None
+    last=closed[-1]
+    lo=zone_low if zone_low is not None else entry
+    hi=zone_high if zone_high is not None else entry
+    if direction=='LONG':
+        touched=last['low']<=hi
+        rejected=last['close']>=lo
+        bullish_close=last['close']>last['open']
+        confirmed=touched and rejected and bullish_close
+    else:
+        touched=last['high']>=lo
+        rejected=last['close']<=hi
+        bearish_close=last['close']<last['open']
+        confirmed=touched and rejected and bearish_close
+    return confirmed,(last if confirmed else None)
+
 
 def track_pending_limits():
     if not ENABLE_PENDING_LIMITS:
@@ -3112,13 +3204,22 @@ def track_pending_limits():
                         f'{PENDING_LIMIT_TIMEOUT_MIN}min -- cancelled.'
                     )
                     continue
-            candles=fetch_tracking_candle(row['symbol'],6)
-            if not candles:
-                continue
-            c=candles[-1]; entry=float(row['entry'])
-            # Full candle range, not one-sided touch.
-            filled=c['low']<=entry<=c['high']
-            if not filled:
+            entry=float(row['entry'])
+            direction=row['direction']
+            try:
+                stored_struct=json.loads(row['factors_json'] or '{}').get('structure_levels',{})
+            except Exception:
+                stored_struct={}
+            zone_low=stored_struct.get('zone_low'); zone_high=stored_struct.get('zone_high')
+
+            # Not a mechanical "price touched the entry price" fill: the
+            # 15M zone was noted at approval time, and the order only
+            # triggers once the 5M shows a genuine RETEST -- price wicks
+            # into the zone AND closes back on the correct side (a real
+            # rejection), same confirmation pattern used for sweeps
+            # elsewhere. A bare touch with no reaction is not a trigger.
+            confirmed,c=_check_zone_retest(row['symbol'],direction,entry,zone_low,zone_high)
+            if not confirmed:
                 continue
 
             # Structural SL at fill: the SETUP itself is a 15M zone (POI) --
@@ -3127,10 +3228,6 @@ def track_pending_limits():
             # point for this thesis. Prefer that over a fresh 5M-candle
             # "sweep" computed right at the moment of fill, which can just
             # be the approach into the zone, not a confirmed reaction yet.
-            try:
-                stored_struct=json.loads(row['factors_json'] or '{}').get('structure_levels',{})
-            except Exception:
-                stored_struct={}
             struct_tf=TIMEFRAMES[2]
             struct_c=fetch_klines(row['symbol'],struct_tf,30)
             a_atr=stored_struct.get('atr_5m') or (atr(struct_c) if struct_c else abs(entry-row['sl'])*0.3)
@@ -3139,15 +3236,13 @@ def track_pending_limits():
             except Exception:
                 mult={}
             m1,m2,m3=mult.get('tp1',1.5),mult.get('tp2',2.3),mult.get('tp3',3.2)
-            direction=row['direction']
-            zone_low=stored_struct.get('zone_low'); zone_high=stored_struct.get('zone_high')
             if direction=='LONG':
                 if zone_low is not None:
                     structural=zone_low
                 elif struct_c:
                     structural=min(x['low'] for x in struct_c[-3:])
                 else:
-                    structural=min(x['low'] for x in candles[-3:])
+                    structural=c['low']
                 new_sl=min(structural-0.25*a_atr,entry-0.60*a_atr)
                 risk=entry-new_sl
                 tps=(entry+m1*risk,entry+m2*risk,entry+m3*risk)
@@ -3157,7 +3252,7 @@ def track_pending_limits():
                 elif struct_c:
                     structural=max(x['high'] for x in struct_c[-3:])
                 else:
-                    structural=max(x['high'] for x in candles[-3:])
+                    structural=c['high']
                 new_sl=max(structural+0.25*a_atr,entry+0.60*a_atr)
                 risk=new_sl-entry
                 tps=(entry-m1*risk,entry-m2*risk,entry-m3*risk)
