@@ -3075,6 +3075,7 @@ def insert_pending_limit(a, levels=None):
         'tp3': abs(tp3-entry)/risk_orig,
     }
     factors_json=json.dumps({'quant': a.get('factor_flags', {}), 'quant_score': a.get('score'),
+                              'structure_levels': a.get('structure_levels', {}),
                               'gemini_zone_validated': bool(levels),
                               'note': 'pending_limit -- zone confirmed by Gemini' if levels
                                       else 'pending_limit -- no Gemini call'})
@@ -3120,30 +3121,44 @@ def track_pending_limits():
             if not filled:
                 continue
 
-            # Structural sweep/ATR at fill MUST come from the real 5M
-            # frame quant itself uses for sweep detection -- NOT
-            # TRACK_TIMEFRAME (1m), which is only meant for tight
-            # entry-price monitoring. Using 1m noise here was producing a
-            # near-zero "sweep" and a tiny 1m ATR, placing SL a few pips
-            # from entry and getting it hit almost immediately on fill.
+            # Structural SL at fill: the SETUP itself is a 15M zone (POI) --
+            # its own boundary (already known BEFORE fill, from the same
+            # zone that justified this order) is the real invalidation
+            # point for this thesis. Prefer that over a fresh 5M-candle
+            # "sweep" computed right at the moment of fill, which can just
+            # be the approach into the zone, not a confirmed reaction yet.
+            try:
+                stored_struct=json.loads(row['factors_json'] or '{}').get('structure_levels',{})
+            except Exception:
+                stored_struct={}
             struct_tf=TIMEFRAMES[2]
             struct_c=fetch_klines(row['symbol'],struct_tf,30)
-            a_atr=atr(struct_c) if struct_c else abs(entry-row['sl'])*0.3
+            a_atr=stored_struct.get('atr_5m') or (atr(struct_c) if struct_c else abs(entry-row['sl'])*0.3)
             try:
                 mult=json.loads(row['pending_multipliers_json'] or '{}')
             except Exception:
                 mult={}
             m1,m2,m3=mult.get('tp1',1.5),mult.get('tp2',2.3),mult.get('tp3',3.2)
             direction=row['direction']
-            sweep_src=struct_c[-3:] if struct_c else candles[-3:]
+            zone_low=stored_struct.get('zone_low'); zone_high=stored_struct.get('zone_high')
             if direction=='LONG':
-                sweep=min(x['low'] for x in sweep_src)
-                new_sl=min(sweep-0.3*a_atr,entry-0.6*a_atr)
+                if zone_low is not None:
+                    structural=zone_low
+                elif struct_c:
+                    structural=min(x['low'] for x in struct_c[-3:])
+                else:
+                    structural=min(x['low'] for x in candles[-3:])
+                new_sl=min(structural-0.25*a_atr,entry-0.60*a_atr)
                 risk=entry-new_sl
                 tps=(entry+m1*risk,entry+m2*risk,entry+m3*risk)
             else:
-                sweep=max(x['high'] for x in sweep_src)
-                new_sl=max(sweep+0.3*a_atr,entry+0.6*a_atr)
+                if zone_high is not None:
+                    structural=zone_high
+                elif struct_c:
+                    structural=max(x['high'] for x in struct_c[-3:])
+                else:
+                    structural=max(x['high'] for x in candles[-3:])
+                new_sl=max(structural+0.25*a_atr,entry+0.60*a_atr)
                 risk=new_sl-entry
                 tps=(entry-m1*risk,entry-m2*risk,entry-m3*risk)
 
