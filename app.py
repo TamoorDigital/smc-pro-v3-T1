@@ -1791,7 +1791,6 @@ def scheduled_scan():
 
 def scheduled_track():
     track_trades()
-    track_pending_limits()
 
 # ----------------------------- Telegram commands ----------------------
 def telegram_poll():
@@ -2060,6 +2059,23 @@ FVG_MIN_ATR = max(0.01, float(os.getenv('FVG_MIN_ATR', '0.15')))
 OB_MIN_DISPLACEMENT_ATR = max(0.05, float(os.getenv('OB_MIN_DISPLACEMENT_ATR', '0.35')))
 MIN_STRUCTURE_AGREEMENTS = max(1, int(os.getenv('MIN_STRUCTURE_AGREEMENTS', '2')))
 MAX_STRUCTURE_DISAGREEMENT = min(1.0, max(0.0, float(os.getenv('MAX_STRUCTURE_DISAGREEMENT', '0.50'))))
+SL_STRUCTURE_TOLERANCE_ATR = max(0.1, float(os.getenv('SL_STRUCTURE_TOLERANCE_ATR', '1.5')))
+# How much EMA20/EMA50 must separate (in ATR units, 1h) before trend_regime
+# counts as aligned. Diagnostic logging reports the real ratio every scan
+# so this can be tuned from observed numbers instead of guessing.
+TREND_REGIME_ATR_MULT = max(0.05, float(os.getenv('TREND_REGIME_ATR_MULT', '1.0')))
+# Graded pass/fail threshold (0-1) applied to trend_strength=min(1.0,
+# ratio/TREND_REGIME_ATR_MULT) -- same style as HTF_BIAS_MIN_STRENGTH.
+TREND_REGIME_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('TREND_REGIME_MIN_STRENGTH', '0.6'))))
+# Graded (0-1) HTF bias strength threshold -- used inside the SMC strategy.
+HTF_BIAS_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('HTF_BIAS_MIN_STRENGTH', '0.6'))))
+# 3-strategy voting: each strategy scores 0-100 independently; a strategy
+# "passes" at its own threshold. >=2/3 passing -> Gemini validation (3/3
+# tagged higher-confidence). <=1/3 -> NO_TRADE. No separate blocking hard
+# filter anymore -- HTF bias/trend are now internal SMC/Trend components.
+SMC_MIN_SCORE = float(os.getenv('SMC_MIN_SCORE', '55'))
+TREND_MIN_SCORE = float(os.getenv('TREND_MIN_SCORE', '55'))
+MEANREV_MIN_SCORE = float(os.getenv('MEANREV_MIN_SCORE', '55'))
 FACTOR_MIN_SAMPLE = max(10, int(os.getenv('FACTOR_MIN_SAMPLE', '20')))
 INTRABAR_POLICY = os.getenv('INTRABAR_POLICY', 'conservative').strip().lower()
 if INTRABAR_POLICY not in ('conservative', 'optimistic', 'unknown'):
@@ -2312,133 +2328,76 @@ def build_analysis(symbol):
     c1=a['_raw'][tf1]; c2=a['_raw'][tf2]; c3=a['_raw'][tf3]
     a1,a2,a3=analyze_tf(c1),analyze_tf(c2),analyze_tf(c3)
 
-    # Diagnostic: log the real 1h EMA20/EMA50/ATR numbers behind
-    # trend_regime every scan, so "is it a code bug or is the market just
-    # not trending" can be answered from actual data instead of guessing.
-    _trend_ratio = abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
-    log.info('[TREND_REGIME] %s ema20=%.6g ema50=%.6g atr1h=%.6g ratio=%.3f threshold=%.3f -> %s',
-              symbol, a1['ema20'], a1['ema50'], a1['atr'], _trend_ratio,
-              TREND_REGIME_ATR_MULT, 'PASS' if _trend_ratio>=TREND_REGIME_ATR_MULT else 'fail')
-
-    scores={'LONG':0.0,'SHORT':0.0}
-    reasons={'LONG':[],'SHORT':[]}
-    flags_by_dir={}
-    htf_strength_by_dir={}
+    # 3 independent strategies, each scored 0-100 per direction. No
+    # separate blocking hard filter -- HTF bias/trend are internal SMC/
+    # Trend components now, informational only via htf_bias_score/
+    # trend_regime_score below.
+    strat_scores={'LONG':{},'SHORT':{}}
+    strat_reasons={'LONG':{},'SHORT':{}}
+    strat_flags={'LONG':{},'SHORT':{}}
+    strat_extra={'LONG':{},'SHORT':{}}
     for d in ('LONG','SHORT'):
-        ema_ok=(a1.get('ema200') is None or (d=='LONG' and a1['price']>a1['ema200']) or (d=='SHORT' and a1['price']<a1['ema200']))
-        htf_strength=_htf_bias_strength(a1,d,ema_ok)
-        htf_ok=htf_strength>=HTF_BIAS_MIN_STRENGTH
-        htf_strength_by_dir[d]=htf_strength
-        # Graded, same 0-1/threshold pattern as HTF bias: 1.0 ATR of
-        # EMA20/50 separation = full strength (still tunable via
-        # TREND_REGIME_ATR_MULT), pass/fail at TREND_REGIME_MIN_STRENGTH.
-        trend_strength=min(1.0,_trend_ratio/TREND_REGIME_ATR_MULT)
-        trend_ok=trend_strength>=TREND_REGIME_MIN_STRENGTH
-        log.info('[HTF_BIAS] %s dir=%s strength=%.2f threshold=%.2f -> %s',
-                  symbol, d, htf_strength, HTF_BIAS_MIN_STRENGTH, 'PASS' if htf_ok else 'fail')
-        log.info('[TREND_REGIME] %s dir=%s strength=%.2f threshold=%.2f -> %s',
-                  symbol, d, trend_strength, TREND_REGIME_MIN_STRENGTH, 'PASS' if trend_ok else 'fail')
+        s_smc,r_smc,f_smc,x_smc=_score_smc(a1,a2,a3,c1,c2,c3,d)
+        s_trend,r_trend,f_trend,x_trend=_score_trend(a1,a2,a3,c1,c2,c3,d)
+        s_mr,r_mr,f_mr,x_mr=_score_meanrev(a1,a2,a3,c1,c2,c3,d)
+        strat_scores[d]={'smc':s_smc,'trend':s_trend,'meanrev':s_mr}
+        strat_reasons[d]={'smc':r_smc,'trend':r_trend,'meanrev':r_mr}
+        strat_flags[d]={'smc':f_smc,'trend':f_trend,'meanrev':f_mr}
+        strat_extra[d]={'smc':x_smc,'trend':x_trend,'meanrev':x_mr}
+        log.info('[VOTE] %s dir=%s SMC=%.1f(%s) Trend=%.1f(%s) MeanRev=%.1f(%s)',
+                  symbol,d,s_smc,'PASS' if s_smc>=SMC_MIN_SCORE else 'fail',
+                  s_trend,'PASS' if s_trend>=TREND_MIN_SCORE else 'fail',
+                  s_mr,'PASS' if s_mr>=MEANREV_MIN_SCORE else 'fail')
 
-        zone=detect_zone(c2,d)
-        fvg=detect_fvg(c2,d)
-        in_ob=bool(zone and zone['low']<=a3['price']<=zone['high'])
-        in_fvg=bool(fvg and fvg['low']<=a3['price']<=fvg['high'])
-        in_poi=in_ob or in_fvg
-        # Graded POI: order-block+FVG confluence scores higher than either
-        # alone, instead of a flat pass the moment price touches just one.
-        poi_strength=0.5*float(in_ob)+0.5*float(in_fvg)
+    # Voting: count passes per direction, pick the direction with a valid
+    # vote (>=2/3). If both directions somehow qualify, take the stronger
+    # combined score. If neither qualifies, no direction (NO_TRADE).
+    vote_info={}
+    for d in ('LONG','SHORT'):
+        passes=[strat_scores[d]['smc']>=SMC_MIN_SCORE,
+                strat_scores[d]['trend']>=TREND_MIN_SCORE,
+                strat_scores[d]['meanrev']>=MEANREV_MIN_SCORE]
+        vote_info[d]={'count':sum(passes),'combined':sum(strat_scores[d].values())}
 
-        sweep=a3['bull_sweep'] if d=='LONG' else a3['bear_sweep']
-        sweep_level=a3['bull_sweep_level'] if d=='LONG' else a3['bear_sweep_level']
-        bos=a3['bull_bos'] if d=='LONG' else a3['bear_bos']
-        swing_ref=a3['swing_highs'] if d=='LONG' else a3['swing_lows']
-        choch=(detect_choch(c3,a3['bias'])['bull_choch'] if d=='LONG' else detect_choch(c3,a3['bias'])['bear_choch'])
-        crt_bonus,_=tbs_crt_bonus(c3,d)
-        mom=(a3['bull_mom'] if d=='LONG' else a3['bear_mom'])
-        vol=a3['volume_ratio']>=1.1
-        pbonus=build_pattern_score(detect_candlestick_patterns(c3),d)
-
-        atrv=max(a3['atr'],1e-9)
-        # Graded sweep: how far beyond the swept liquidity level the wick
-        # actually went, in ATR -- a barely-there sweep and a deep
-        # stop-hunt wick used to score the identical flat 12.
-        if sweep and sweep_level is not None:
-            depth=((sweep_level-min(x['low'] for x in c3[-3:])) if d=='LONG'
-                   else (max(x['high'] for x in c3[-3:])-sweep_level))/atrv
-            sweep_strength=min(1.0,max(0.0,depth)/0.5)
-        else:
-            sweep_strength=0.0
-        # Graded BOS: how far the close broke beyond the prior swing, ATR-normalized.
-        if bos and swing_ref:
-            ref_level=swing_ref[-1][1]
-            break_dist=((a3['price']-ref_level) if d=='LONG' else (ref_level-a3['price']))/atrv
-            bos_strength=min(1.0,max(0.0,break_dist)/0.3)
-        else:
-            bos_strength=0.0
-        choch_strength=1.0 if choch else 0.0  # binary event, no natural magnitude
-        crt_strength=crt_bonus/4.0            # tbs_crt_bonus returns 0 or 4
-        # Graded momentum+volume: smooth falloff from the RSI band center
-        # instead of a hard in/out cutoff, blended with how far volume
-        # exceeds 1.0x (proportional conviction, not just ">=1.1x yes/no").
-        rsi_center=62 if d=='LONG' else 38
-        rsi_strength=max(0.0,1-abs(a3['rsi']-rsi_center)/10)
-        vol_strength=min(1.0,max(0.0,a3['volume_ratio']-1.0))
-        momentum_strength=0.5*rsi_strength+0.5*vol_strength
-        pattern_strength=min(1.0,max(0.0,pbonus/4.0))
-
-        # Grouped scoring: trend/EMA are one regime group; sweep+BOS are
-        # separate trigger evidence; CRT/TBS one group; candle pattern is a
-        # tiebreaker only. All 9 factors are graded (0-1 strength x max
-        # points), not flat pass/fail -- a marginal pass and a clean
-        # textbook setup no longer score identically.
-        if htf_strength>0: scores[d]+=20*htf_strength; reasons[d].append(f'HTF bias {htf_strength:.0%}')
-        if trend_strength>0: scores[d]+=15*trend_strength; reasons[d].append(f'trend regime {trend_strength:.0%}')
-        if poi_strength>0: scores[d]+=18*poi_strength; reasons[d].append(f'15M POI {poi_strength:.0%}')
-        if sweep_strength>0: scores[d]+=12*sweep_strength; reasons[d].append(f'5M sweep {sweep_strength:.0%}')
-        if bos_strength>0: scores[d]+=12*bos_strength; reasons[d].append(f'5M BOS {bos_strength:.0%}')
-        if choch_strength>0: scores[d]+=5*choch_strength; reasons[d].append('5M CHOCH/MSS')
-        if crt_strength>0: scores[d]+=4*crt_strength; reasons[d].append(f'CRT/TBS {crt_strength:.0%}')
-        if momentum_strength>0: scores[d]+=5*momentum_strength; reasons[d].append(f'momentum+volume {momentum_strength:.0%}')
-        if pattern_strength>0: scores[d]+=2*pattern_strength; reasons[d].append('supportive candle pattern')
-
-        flags_by_dir[d]={
-            'htf_bias':htf_ok,
-            'trend_regime':trend_ok,
-            'liquidity_sweep':bool(sweep),
-            'bos':bool(bos),
-            'order_block':bool(in_ob),
-            'choch':bool(choch),
-            'fvg':bool(in_fvg),
-            'crt':bool(crt_bonus),
-            'tbs':bool(crt_bonus),
-            'candle_pattern':bool(pbonus>0),
-            'volume_expansion':bool(vol),
-            'momentum':bool(mom),
-            'eqh_eql_pool':False,
-        }
-
-    # Never silently pick LONG on a tie/near-tie.
-    if abs(scores['LONG']-scores['SHORT']) < MIN_DIRECTION_GAP:
+    candidates=[d for d in ('LONG','SHORT') if vote_info[d]['count']>=2]
+    if not candidates:
         direction=None
+    elif len(candidates)==1:
+        direction=candidates[0]
     else:
-        direction='LONG' if scores['LONG']>scores['SHORT'] else 'SHORT'
+        direction=max(candidates,key=lambda d:vote_info[d]['combined'])
 
-    if direction is None:
+    if direction is not None and abs(vote_info['LONG']['combined']-vote_info['SHORT']['combined'])<MIN_DIRECTION_GAP and len(candidates)>1:
+        direction=None  # never silently pick on a near-tie between two qualifying directions
+
+    vote_count=vote_info[direction]['count'] if direction else 0
+    # Composite 0-100 "best_score" for downstream MIN_SCORE/logging/
+    # dashboard compatibility: average of the 3 strategy scores, with a
+    # 3/3-unanimous bonus (higher confidence) capped at 100.
+    if direction:
+        avg_score=vote_info[direction]['combined']/3.0
+        best_score=min(100.0,avg_score*1.10) if vote_count==3 else avg_score
+    else:
         best_score=0.0
-        reasons_best=['LONG/SHORT score gap below minimum direction threshold']
+
+    _trend_ratio=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
+    if direction is None:
+        reasons_best=['Fewer than 2/3 strategies passed -- NO_TRADE']
         entry=a3['price']
         atrv=a3['atr'] or entry*0.005
-        sl=entry-atrv if scores['LONG']>=scores['SHORT'] else entry+atrv
-        tp1=entry+atrv if scores['LONG']>=scores['SHORT'] else entry-atrv
-        tp2=entry+2*atrv if scores['LONG']>=scores['SHORT'] else entry-2*atrv
-        tp3=entry+3*atrv if scores['LONG']>=scores['SHORT'] else entry-3*atrv
+        long_lean=vote_info['LONG']['combined']>=vote_info['SHORT']['combined']
+        sl=entry-atrv if long_lean else entry+atrv
+        tp1=entry+atrv if long_lean else entry-atrv
+        tp2=entry+2*atrv if long_lean else entry-2*atrv
+        tp3=entry+3*atrv if long_lean else entry-3*atrv
         flags={}
-        hard_htf=False; hard_trend=False
+        htf_strength=0.0
     else:
-        best_score=min(100.0,scores[direction])
-        reasons_best=reasons[direction]
-        hard_htf=flags_by_dir[direction]['htf_bias']
-        hard_trend=flags_by_dir[direction]['trend_regime']
+        reasons_best=(strat_reasons[direction]['smc']+strat_reasons[direction]['trend']
+                      +strat_reasons[direction]['meanrev'])
+        reasons_best=[f'[{vote_count}/3 strategies] '+', '.join(reasons_best[:3])+f' (+{max(0,len(reasons_best)-3)} more)'] if reasons_best else []
+        flags=strat_flags[direction]['smc']  # SMC's own bos/choch/order_block/fvg/crt/tbs -- what structure_agreement compares Gemini against
+        htf_strength=strat_extra[direction]['smc'].get('htf_strength',0.0)
         entry=a3['price']
         atrv=a3['atr'] or entry*0.005
         sweep_level=a3.get('bull_sweep_level') if direction=='LONG' else a3.get('bear_sweep_level')
@@ -2450,7 +2409,6 @@ def build_analysis(symbol):
             sl=max(structural+0.25*atrv,entry+0.60*atrv)
         risk=abs(entry-sl)
         tp1,tp2,tp3=_choose_targets(a1,a2,direction,entry,risk)
-        flags=flags_by_dir[direction]
 
     # Real structural reference points (from the SAME quant detectors that
     # scored this setup) -- kept separately from the trade levels so
@@ -2479,9 +2437,11 @@ def build_analysis(symbol):
         'rr':abs(tp3-entry)/max(abs(entry-sl),1e-12),
         'reasons':reasons_best,
         'factor_flags':flags,
-        'htf_bias_ok':bool(hard_htf),
-        'trend_regime_ok':bool(hard_trend),
-        'htf_bias_score':round(htf_strength_by_dir.get(direction,0.0),3) if direction else 0.0,
+        'vote_count':vote_count,
+        'strategy_scores':strat_scores[direction] if direction else {},
+        'htf_bias_ok':bool(direction),
+        'trend_regime_ok':bool(direction),
+        'htf_bias_score':round(htf_strength,3),
         'trend_regime_score':round(min(1.0,_trend_ratio/TREND_REGIME_ATR_MULT),3),
         'zone_entry':None,
         'structure_levels':structure_levels,
@@ -2600,91 +2560,66 @@ def _validate_and_correct_gemini_levels(best, ai):
     return approved, trade_plan, reason, gemini_score
 
 
-def gemini_validate_zone(analysis):
-    """Entry-ONLY Gemini call for setups whose score hasn't reached
-    MIN_SCORE yet (hard filters -- bias+trend -- already passed). This is
-    NOT gated on quant's own detect_zone()/detect_fvg() having fired --
-    Gemini judges directly from raw candles whether an order block or FVG
-    is forming here at all, independent of the quant detector.
-    Deliberately asks for ENTRY ONLY, not SL/TP: if approved, the limit
-    order just rests at that entry and SL/TP are computed later from the
-    REAL reaction candle once price actually fills (see
-    track_pending_limits()) -- guessing SL/TP now, before any reaction
-    has happened, would be arbitrary."""
-    prompt={
-        'task':('Hard filters (1H HTF bias + trend regime) have already passed, but the '
-                'setup has not fully triggered -- no confirmed 5M sweep/BOS/CHOCH yet, and '
-                'no claim is made here that quant\'s own zone detector found anything. '
-                'Follow this exact sequence using ONLY the raw OHLCV supplied:\n'
-                '1) 15M: scan the 15M candles for the NEXT order block or FVG forming in the '
-                'direction the 1H bias/trend supports -- a LONG zone must sit at/near real '
-                'support (a prior demand zone, swing low, or untested OB/FVG below current '
-                'price); a SHORT zone must sit at/near real resistance (prior supply, swing '
-                'high, untested OB/FVG above current price). Reject if nothing structurally '
-                'clean is forming, or if the only candidate zone is already mid-range with no '
-                'S/R confluence.\n'
-                '2) 5M: before finalizing, check the 5M candles for any recent change of '
-                'character (CHOCH) or shift in trend AGAINST the intended direction -- if 5M '
-                'structure is already breaking the opposite way, REJECT even if the 15M zone '
-                'looks clean, since the reaction may already be over or reversing.\n'
-                '3) Only if both checks pass, propose a precise entry AT or very near the '
-                '15M zone\'s edge (not chasing current price, not mid-zone).'),
-        'symbol':analysis['symbol'],
-        'framework':analysis['framework'],
-        'timeframes':analysis['timeframes'],
-        'raw_ohlcv_candles':analysis.get('candles',{}),
-        'timeframe_analysis':{
-            k:{
-                x:(_round_price(v) if x in ('ema20','ema50','ema200','atr','price')
-                   else (round(v,2) if x in ('rsi','volume_ratio') else v))
-                for x,v in av.items()
-                if x not in ('high','low','range','swing_highs','swing_lows')
-            } for k,av in analysis['tf'].items()
-        }
-    }
-    system="""You are an independent second analyst for a crypto trading research bot.
-Use ONLY the supplied raw OHLCV candles and derived neutral market data.
-Do NOT receive or use a quant score, quant direction, or quant Entry/SL/TP.
-This is an ENTRY-ONLY check, not a full trade: hard filters (1H bias+trend) already
-passed, but no 5M sweep/BOS/CHOCH has been confirmed yet.
-
-Follow the sequence given in the task field precisely:
-1) 15M -- find the next real order block/FVG in the supported direction, requiring
-   support/resistance confluence (not a random mid-range zone).
-2) 5M -- check for a change of character or trend shift AGAINST the intended
-   direction; if the 5M is already turning the other way, REJECT regardless of how
-   clean the 15M zone looks.
-3) Only then propose an entry at/near the zone edge.
-
-Do NOT propose SL or TP; those get set later from the actual reaction once price
-fills. If nothing worth watching is forming, or step 2 fails, REJECT.
-Return ONLY JSON:
-{
- "decision":"APPROVE|REJECT",
- "direction":"LONG|SHORT",
- "score":0-100,
- "confidence":0-100,
- "entry":number,
- "order_block_detected":true/false,"fvg_detected":true/false,
- "support_resistance_confluence":true/false,
- "choch_against_direction":true/false,
- "reason":"brief evidence-based reason"
-}"""
-    return gemini_json(system,prompt,max_output_tokens=2000)
+def _adx(candles, n=14):
+    """Wilder's ADX -- direction-agnostic trend-STRENGTH (0-100). Used by
+    the Trend-Following strategy's 1H component."""
+    if len(candles) < n*2:
+        return 0.0
+    trs=[]; pdms=[]; mdms=[]
+    for i in range(1,len(candles)):
+        c=candles[i]; p=candles[i-1]
+        up=c['high']-p['high']; down=p['low']-c['low']
+        pdms.append(up if (up>down and up>0) else 0.0)
+        mdms.append(down if (down>up and down>0) else 0.0)
+        trs.append(max(c['high']-c['low'], abs(c['high']-p['close']), abs(c['low']-p['close'])))
+    def _wilder(vals):
+        out=[sum(vals[:n])]
+        for v in vals[n:]:
+            out.append(out[-1]-out[-1]/n+v)
+        return out
+    tr_s=_wilder(trs); pdm_s=_wilder(pdms); mdm_s=_wilder(mdms)
+    dxs=[]
+    for t,pd,md in zip(tr_s,pdm_s,mdm_s):
+        if t<=0: continue
+        pdi=100*pd/t; mdi=100*md/t
+        dxs.append(100*abs(pdi-mdi)/max(pdi+mdi,1e-9))
+    return sum(dxs[-n:])/min(n,len(dxs)) if dxs else 0.0
 
 
-SL_STRUCTURE_TOLERANCE_ATR = max(0.1, float(os.getenv('SL_STRUCTURE_TOLERANCE_ATR', '1.5')))
-# How much EMA20/EMA50 must separate (in ATR units, 1h) before trend_regime
-# counts as aligned. Diagnostic logging below reports the real ratio every
-# scan so this can be tuned from observed numbers instead of guessing.
-TREND_REGIME_ATR_MULT = max(0.05, float(os.getenv('TREND_REGIME_ATR_MULT', '1.0')))
-# Graded pass/fail threshold (0-1) applied to trend_strength=min(1.0,
-# ratio/TREND_REGIME_ATR_MULT) -- same style as HTF_BIAS_MIN_STRENGTH.
-TREND_REGIME_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('TREND_REGIME_MIN_STRENGTH', '0.6'))))
-# Graded (0-1) version of the HTF bias check instead of the old strict
-# all-4-conditions AND. Mirrors TREND_REGIME_ATR_MULT's ratio+threshold
-# pattern -- see _htf_bias_strength() for what the 4 components are.
-HTF_BIAS_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('HTF_BIAS_MIN_STRENGTH', '0.6'))))
+def _vwap(candles):
+    """Rolling volume-weighted average price over the given candle window.
+    Used by the Mean-Reversion strategy as a fair-value reference."""
+    cum_pv=0.0; cum_v=0.0
+    for c in candles:
+        tp=(c['high']+c['low']+c['close'])/3
+        cum_pv+=tp*c['volume']; cum_v+=c['volume']
+    return cum_pv/cum_v if cum_v else candles[-1]['close']
+
+
+def _bollinger(candles, n=20, k=2.0):
+    """(lower, mid, upper) Bollinger Bands over the last n closes. Used by
+    the Mean-Reversion strategy to judge price extremes."""
+    closes=[c['close'] for c in candles[-n:]]
+    if len(closes)<2:
+        last=candles[-1]['close']
+        return last,last,last
+    mid=sum(closes)/len(closes)
+    var=sum((x-mid)**2 for x in closes)/len(closes)
+    sd=var**0.5
+    return mid-k*sd, mid, mid+k*sd
+
+
+def _swing_structure_strength(swings, direction, higher):
+    """0/1: does the latest swing (high or low) sit higher (or lower) than
+    the one before it, in `direction`'s favor? `higher=True` checks for a
+    higher swing (HH for LONG on highs, wanting price making new highs);
+    same shape used for HL/LH/LL depending on which swing list and
+    boolean is passed in."""
+    if len(swings)<2:
+        return 0.0
+    a,b=swings[-2][1],swings[-1][1]
+    return 1.0 if ((b>a) if higher else (b<a)) else 0.0
+
 
 def _htf_bias_strength(a1, direction, ema_ok):
     """0-1 graded HTF bias strength for the 1h timeframe, direction-aware.
@@ -2709,6 +2644,213 @@ def _htf_bias_strength(a1, direction, ema_ok):
     if a1.get('bias')==('BULLISH' if direction=='LONG' else 'BEARISH'):
         score+=0.25
     return score
+
+# ==================== Strategy 1: SMC ====================
+def _score_smc(a1,a2,a3,c1,c2,c3,d):
+    """Smart Money Concept -- 1H structure+liquidity direction, 15M
+    BOS/CHOCH/OB/FVG/sweep, 5M entry confirmation/displacement. Weights
+    sum to 100: htf_bias 20, structure/liquidity(trend) 15, POI 20,
+    sweep 15, BOS 15, CHOCH 5, CRT/TBS 5, momentum+volume(entry confirm) 5."""
+    ema_ok=(a1.get('ema200') is None or (d=='LONG' and a1['price']>a1['ema200']) or (d=='SHORT' and a1['price']<a1['ema200']))
+    htf_strength=_htf_bias_strength(a1,d,ema_ok)
+    trend_ratio=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
+    trend_strength=min(1.0,trend_ratio/TREND_REGIME_ATR_MULT)
+
+    zone=detect_zone(c2,d); fvg=detect_fvg(c2,d)
+    in_ob=bool(zone and zone['low']<=a3['price']<=zone['high'])
+    in_fvg=bool(fvg and fvg['low']<=a3['price']<=fvg['high'])
+    poi_strength=0.5*float(in_ob)+0.5*float(in_fvg)
+
+    sweep=a3['bull_sweep'] if d=='LONG' else a3['bear_sweep']
+    sweep_level=a3['bull_sweep_level'] if d=='LONG' else a3['bear_sweep_level']
+    bos=a3['bull_bos'] if d=='LONG' else a3['bear_bos']
+    swing_ref=a3['swing_highs'] if d=='LONG' else a3['swing_lows']
+    choch=(detect_choch(c3,a3['bias'])['bull_choch'] if d=='LONG' else detect_choch(c3,a3['bias'])['bear_choch'])
+    crt_bonus,_=tbs_crt_bonus(c3,d)
+    pbonus=build_pattern_score(detect_candlestick_patterns(c3),d)
+
+    atrv=max(a3['atr'],1e-9)
+    if sweep and sweep_level is not None:
+        depth=((sweep_level-min(x['low'] for x in c3[-3:])) if d=='LONG'
+               else (max(x['high'] for x in c3[-3:])-sweep_level))/atrv
+        sweep_strength=min(1.0,max(0.0,depth)/0.5)
+    else:
+        sweep_strength=0.0
+    if bos and swing_ref:
+        ref_level=swing_ref[-1][1]
+        break_dist=((a3['price']-ref_level) if d=='LONG' else (ref_level-a3['price']))/atrv
+        bos_strength=min(1.0,max(0.0,break_dist)/0.3)
+    else:
+        bos_strength=0.0
+    choch_strength=1.0 if choch else 0.0
+    crt_strength=crt_bonus/4.0
+    rsi_center=62 if d=='LONG' else 38
+    rsi_strength=max(0.0,1-abs(a3['rsi']-rsi_center)/10)
+    vol_strength=min(1.0,max(0.0,a3['volume_ratio']-1.0))
+    momentum_strength=0.5*rsi_strength+0.5*vol_strength
+
+    score=(20*htf_strength+15*trend_strength+20*poi_strength+15*sweep_strength
+           +15*bos_strength+5*choch_strength+5*crt_strength+5*momentum_strength)
+    reasons=[]
+    if htf_strength>0: reasons.append(f'HTF bias {htf_strength:.0%}')
+    if trend_strength>0: reasons.append(f'liquidity direction {trend_strength:.0%}')
+    if poi_strength>0: reasons.append(f'15M OB/FVG {poi_strength:.0%}')
+    if sweep_strength>0: reasons.append(f'sweep {sweep_strength:.0%}')
+    if bos_strength>0: reasons.append(f'BOS {bos_strength:.0%}')
+    if choch_strength>0: reasons.append('CHOCH')
+    if crt_strength>0: reasons.append('CRT/TBS')
+    if momentum_strength>0: reasons.append(f'entry confirmation {momentum_strength:.0%}')
+    flags={'htf_bias':htf_strength>=HTF_BIAS_MIN_STRENGTH,'trend_regime':trend_strength>=TREND_REGIME_MIN_STRENGTH,
+           'liquidity_sweep':bool(sweep),'bos':bool(bos),'order_block':bool(in_ob),'choch':bool(choch),
+           'fvg':bool(in_fvg),'crt':bool(crt_bonus),'tbs':bool(crt_bonus),'candle_pattern':bool(pbonus>0),
+           'volume_expansion':a3['volume_ratio']>=1.1,'momentum':(a3['bull_mom'] if d=='LONG' else a3['bear_mom']),
+           'eqh_eql_pool':False}
+    return min(100.0,score),reasons,flags,{'htf_strength':htf_strength,'trend_strength':trend_strength}
+
+
+# ==================== Strategy 2: Trend Following + Momentum ====================
+def _score_trend(a1,a2,a3,c1,c2,c3,d):
+    """1H EMA50/200 trend+HH/HL/LH/LL+ADX+major S/R, 15M continuation+
+    pullback+momentum, 5M breakout/retest+momentum candle+volume.
+    Weights sum to 100: ema_trend 20, swing_structure 15, adx 15,
+    sr_context 10, continuation_15m 10, pullback_15m 10, breakout_5m 10,
+    momentum_candle_5m 10."""
+    e200=a1.get('ema200')
+    ema_trend_ok=(e200 is not None and ((d=='LONG' and a1['price']>a1['ema50']>e200) or
+                                          (d=='SHORT' and a1['price']<a1['ema50']<e200)))
+    ema_dist=min(1.0,abs(a1['price']-a1['ema50'])/max(a1['atr'],1e-9)/1.0) if ema_trend_ok else 0.0
+    ema_trend_strength=1.0 if ema_trend_ok else 0.0
+    ema_trend_strength=max(ema_trend_strength,ema_dist*0.5) if ema_trend_ok else 0.0
+    ema_trend_strength=1.0 if ema_trend_ok else 0.0  # binary structural gate, kept simple/explicit
+
+    highs=a1.get('swing_highs') or []; lows=a1.get('swing_lows') or []
+    swing_strength=(_swing_structure_strength(highs,d,True) if d=='LONG'
+                     else _swing_structure_strength(highs,d,False))*0.5 + \
+                    (_swing_structure_strength(lows,d,True) if d=='LONG'
+                     else _swing_structure_strength(lows,d,False))*0.5
+
+    adx=_adx(c1)
+    adx_strength=min(1.0,adx/25.0)
+
+    atrv1=max(a1['atr'],1e-9)
+    opposing=lows if d=='LONG' else highs  # for LONG, opposing wall is a swing LOW below? actually resistance for LONG is a swing HIGH above
+    opposing=highs if d=='LONG' else lows
+    if opposing:
+        dist=abs(opposing[-1][1]-a1['price'])/atrv1
+        sr_strength=min(1.0,dist/2.0)  # far from opposing S/R = more room = stronger
+    else:
+        sr_strength=0.5
+
+    trend15_ok=((d=='LONG' and a2['ema20']>a2['ema50']) or (d=='SHORT' and a2['ema20']<a2['ema50']))
+    continuation_strength=1.0 if trend15_ok else 0.0
+
+    atrv2=max(a2['atr'],1e-9)
+    pullback_dist=min(abs(a2['price']-a2['ema20']),abs(a2['price']-a2['ema50']))/atrv2
+    pullback_strength=max(0.0,1.0-min(1.0,pullback_dist/1.5))
+
+    atrv3=max(a3['atr'],1e-9)
+    recent_high=max(x['high'] for x in c3[-15:-3]) if len(c3)>=15 else a3['high']
+    recent_low=min(x['low'] for x in c3[-15:-3]) if len(c3)>=15 else a3['low']
+    if d=='LONG':
+        broke_out=any(x['close']>recent_high for x in c3[-3:])
+        retested=a3['price']>=recent_high-0.3*atrv3
+        breakout_strength=1.0 if (broke_out and retested) else (0.5 if broke_out else 0.0)
+    else:
+        broke_out=any(x['close']<recent_low for x in c3[-3:])
+        retested=a3['price']<=recent_low+0.3*atrv3
+        breakout_strength=1.0 if (broke_out and retested) else (0.5 if broke_out else 0.0)
+
+    body=abs(c3[-1]['close']-c3[-1]['open']); rng=max(c3[-1]['high']-c3[-1]['low'],1e-9)
+    candle_dir_ok=(c3[-1]['close']>c3[-1]['open']) if d=='LONG' else (c3[-1]['close']<c3[-1]['open'])
+    momentum_candle_strength=(body/rng if candle_dir_ok else 0.0)
+    vol_strength=min(1.0,max(0.0,a3['volume_ratio']-1.0))
+    momentum5_strength=0.5*momentum_candle_strength+0.5*vol_strength
+
+    score=(20*ema_trend_strength+15*swing_strength+15*adx_strength+10*sr_strength
+           +10*continuation_strength+10*pullback_strength+10*breakout_strength+10*momentum5_strength)
+    reasons=[]
+    if ema_trend_strength>0: reasons.append('1H EMA50/200 trend aligned')
+    if swing_strength>0: reasons.append(f'1H swing structure {swing_strength:.0%}')
+    if adx_strength>0: reasons.append(f'ADX {adx:.0f}')
+    if sr_strength>0: reasons.append(f'S/R room {sr_strength:.0%}')
+    if continuation_strength>0: reasons.append('15M trend continuation')
+    if pullback_strength>0: reasons.append(f'15M pullback {pullback_strength:.0%}')
+    if breakout_strength>0: reasons.append(f'5M breakout/retest {breakout_strength:.0%}')
+    if momentum5_strength>0: reasons.append(f'5M momentum candle {momentum5_strength:.0%}')
+    flags={'ema_trend':ema_trend_strength>0,'swing_structure':swing_strength>0,'adx':adx_strength>0,
+           'sr_context':sr_strength>0,'continuation':continuation_strength>0,'pullback':pullback_strength>0,
+           'breakout_retest':breakout_strength>0,'momentum_candle':momentum5_strength>0}
+    return min(100.0,score),reasons,flags,{'adx':adx}
+
+
+# ==================== Strategy 3: Mean Reversion + Liquidity Reversal ====================
+def _score_meanrev(a1,a2,a3,c1,c2,c3,d):
+    """1H ranging/extended+major HTF levels, 15M price extreme+VWAP/
+    Bollinger deviation+RSI extreme, 5M liquidity sweep+rejection+
+    structure reversal+confirmation candle. Weights sum to 100:
+    ranging_1h 20, htf_level_1h 15, price_extreme_15m 15,
+    bollinger_15m 15, rsi_extreme_15m 10, sweep_5m 15, reversal_5m 10."""
+    trend_ratio=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
+    ranging_strength=max(0.0,1.0-min(1.0,trend_ratio))  # low 1h trend strength = ranging = favorable
+
+    atrv1=max(a1['atr'],1e-9)
+    levels=(a1.get('swing_lows') or []) if d=='LONG' else (a1.get('swing_highs') or [])
+    if levels:
+        dist=abs(levels[-1][1]-a1['price'])/atrv1
+        htf_level_strength=max(0.0,1.0-min(1.0,dist/1.0))
+    else:
+        htf_level_strength=0.0
+
+    rng15=max(a2['range'],1e-9)
+    if d=='LONG':
+        extreme_strength=max(0.0,1.0-min(1.0,(a2['price']-a2['low'])/rng15/0.25))
+    else:
+        extreme_strength=max(0.0,1.0-min(1.0,(a2['high']-a2['price'])/rng15/0.25))
+
+    lo,mid,hi=_bollinger(c2)
+    band_half=max((hi-lo)/2,1e-9)
+    if d=='LONG':
+        boll_strength=max(0.0,min(1.0,(lo-a2['price'])/band_half+1.0)) if a2['price']<=lo+band_half*0.3 else 0.0
+    else:
+        boll_strength=max(0.0,min(1.0,(a2['price']-hi)/band_half+1.0)) if a2['price']>=hi-band_half*0.3 else 0.0
+
+    rsi15=a2['rsi']
+    if d=='LONG':
+        rsi_strength=max(0.0,min(1.0,(35-rsi15)/15.0)) if rsi15<35 else 0.0
+    else:
+        rsi_strength=max(0.0,min(1.0,(rsi15-65)/15.0)) if rsi15>65 else 0.0
+
+    sweep=a3['bull_sweep'] if d=='LONG' else a3['bear_sweep']
+    sweep_level=a3['bull_sweep_level'] if d=='LONG' else a3['bear_sweep_level']
+    atrv3=max(a3['atr'],1e-9)
+    if sweep and sweep_level is not None:
+        depth=((sweep_level-min(x['low'] for x in c3[-3:])) if d=='LONG'
+               else (max(x['high'] for x in c3[-3:])-sweep_level))/atrv3
+        sweep_strength=min(1.0,max(0.0,depth)/0.5)
+    else:
+        sweep_strength=0.0
+
+    last=c3[-1]; prev=c3[-2] if len(c3)>=2 else last
+    reversed_close=(last['close']>prev['close'] and last['close']>last['open']) if d=='LONG' else \
+                    (last['close']<prev['close'] and last['close']<last['open'])
+    pbonus=build_pattern_score(detect_candlestick_patterns(c3),d)
+    reversal_strength=(0.6 if reversed_close else 0.0)+min(0.4,pbonus/10.0)
+
+    score=(20*ranging_strength+15*htf_level_strength+15*extreme_strength+15*boll_strength
+           +10*rsi_strength+15*sweep_strength+10*min(1.0,reversal_strength))
+    reasons=[]
+    if ranging_strength>0.3: reasons.append(f'1H ranging {ranging_strength:.0%}')
+    if htf_level_strength>0: reasons.append(f'major HTF level {htf_level_strength:.0%}')
+    if extreme_strength>0: reasons.append(f'15M price extreme {extreme_strength:.0%}')
+    if boll_strength>0: reasons.append(f'Bollinger deviation {boll_strength:.0%}')
+    if rsi_strength>0: reasons.append(f'RSI extreme ({rsi15:.0f})')
+    if sweep_strength>0: reasons.append(f'liquidity sweep {sweep_strength:.0%}')
+    if reversal_strength>0: reasons.append('rejection/reversal candle')
+    flags={'ranging':ranging_strength>0.3,'htf_level':htf_level_strength>0,'price_extreme':extreme_strength>0,
+           'bollinger':boll_strength>0,'rsi_extreme':rsi_strength>0,'liquidity_sweep':bool(sweep),
+           'reversal':reversal_strength>0}
+    return min(100.0,score),reasons,flags,{'rsi15':rsi15}
+
 
 def _verify_sl_against_structure(direction, sl, structure_levels):
     """Cross-checks Gemini's proposed SL against the SAME structural points
@@ -2820,124 +2962,6 @@ def _final_level_check(direction, entry, sl, tp1, tp2, tp3):
     return True,'OK'
 
 # ---------------- Watch-state / scan execution ----------------
-def _validate_zone_entry(best, ai):
-    """Lightweight APPROVE/REJECT for the entry-only zone-limit path.
-    Gemini here proposes ONLY an entry level -- no SL/TP -- so this does
-    NOT run the full _validate_and_correct_gemini_levels structural/SL
-    pipeline (there's no SL yet to verify). Just checks decision,
-    direction agreement with quant, and that a sane entry number came
-    back. Real SL/TP get set later at fill time from the actual reaction
-    (see track_pending_limits()). Returns (approved, entry, reason, gemini_score).
-    """
-    try:
-        gemini_score=float(ai.get('score',ai.get('confidence',0)) or 0)
-    except (TypeError,ValueError):
-        gemini_score=0.0
-    # ai.get('reason') can be genuinely absent when Gemini's response was
-    # truncated before it finished writing the reason string (see
-    # _parse_gemini_json_text's _truncated_reject fallback) -- say so
-    # honestly instead of the generic "Gemini rejected", which reads as
-    # if Gemini gave a considered answer with nothing more to add.
-    reason=ai.get('reason') or (
-        'Gemini response was truncated before a reason could be captured '
-        '(consider raising max_output_tokens if this repeats)'
-        if ai.get('_truncated_reject') else 'Gemini rejected (no reason given)'
-    )
-    if str(ai.get('decision','REJECT')).upper()!='APPROVE' or gemini_score<GEMINI_MIN_SCORE:
-        return False,None,reason,gemini_score
-    if ai.get('choch_against_direction'):
-        # Defense in depth: even if Gemini's own decision logic slipped
-        # and said APPROVE, a self-reported change-of-character against
-        # the intended direction means the 5M reaction may already be
-        # over or reversing -- do not place a resting limit order into that.
-        return False,None,'Gemini flagged a 5M change of character against the intended direction',gemini_score
-    g_direction=str(ai.get('direction') or '').upper()
-    if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
-        return False,None,'Gemini direction disagrees with quant direction',gemini_score
-    try:
-        entry=float(ai['entry'])
-    except (KeyError,TypeError,ValueError):
-        return False,None,'Gemini approval missing a valid entry level',gemini_score
-    if entry<=0:
-        return False,None,'Gemini entry level invalid',gemini_score
-    return True,entry,reason,gemini_score
-
-
-def _try_zone_limit_order(a):
-    """Called each scan cycle a candidate has passed hard filters
-    (bias+trend) but hasn't reached MIN_SCORE yet. Asks Gemini directly
-    from raw candles whether an order block/FVG worth a resting limit
-    order is forming -- NOT gated on quant's own zone detector. Gemini
-    confirms ONLY the entry level (see gemini_validate_zone /
-    _validate_zone_entry); SL/TP are intentionally left for fill time,
-    when track_pending_limits() computes them from the REAL reaction
-    candle (e.g. SL just below the actual sweep low) rather than a
-    pre-fill guess. Returns (status, note) for the caller's scan-log line.
-    """
-    symbol=a['symbol']; score=float(a.get('score',0))
-    try:
-        ai=gemini_validate_zone(a)
-    except RuntimeError as exc:
-        # A truncated/incomplete APPROVE already exhausted gemini_json()'s
-        # full multi-key fallback -- one more full attempt (fresh call,
-        # not a re-parse) before giving up on this cycle, since a single
-        # bad generation shouldn't cost the whole scan when the schema is
-        # this small.
-        log.warning('[GEMINI] zone check failed once for %s (%s), retrying once: %s',
-                    symbol, type(exc).__name__, exc)
-        try:
-            ai=gemini_validate_zone(a)
-        except Exception as exc2:
-            reason=f'Gemini zone error after retry: {type(exc2).__name__}: {exc2}'
-            with DB_LOCK:
-                con=db()
-                con.execute(
-                    'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason,htf_bias_score,trend_regime_score) VALUES(?,?,?,?,?,?,?,?)',
-                    (now_utc(),symbol,score,'ZONE_LIMIT_ERROR',1,reason,a.get('htf_bias_score'),a.get('trend_regime_score'))
-                )
-                con.commit(); con.close()
-            return 'ZONE_LIMIT_CHECK', f'limit-order zone check errored: {reason}'
-    except Exception as exc:
-        reason=f'Gemini zone error: {type(exc).__name__}: {exc}'
-        with DB_LOCK:
-            con=db()
-            con.execute(
-                'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason,htf_bias_score,trend_regime_score) VALUES(?,?,?,?,?,?,?,?)',
-                (now_utc(),symbol,score,'ZONE_LIMIT_ERROR',1,reason,a.get('htf_bias_score'),a.get('trend_regime_score'))
-            )
-            con.commit(); con.close()
-        return 'ZONE_LIMIT_CHECK', f'limit-order zone check errored: {reason}'
-
-    approved,entry,reason,gemini_score=_validate_zone_entry(a,ai)
-    decision='ZONE_LIMIT_APPROVED' if approved else 'ZONE_LIMIT_REJECTED'
-    with DB_LOCK:
-        con=db()
-        con.execute(
-            'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason,htf_bias_score,trend_regime_score) VALUES(?,?,?,?,?,?,?,?)',
-            (now_utc(),symbol,score,decision,1,f'[Gemini zone {gemini_score:.0f}] {reason}',
-             a.get('htf_bias_score'),a.get('trend_regime_score'))
-        )
-        con.commit(); con.close()
-
-    if not approved:
-        return 'ZONE_LIMIT_CHECK', f'limit order not placed: {reason}'
-
-    # Entry only -- SL/TP fall back to quant's own a[\'sl\']/a[\'tp1/2/3\']
-    # purely as a provisional DB-constraint placeholder. They get FULLY
-    # overwritten at fill time by track_pending_limits() from the real
-    # reaction candle, never sent out or acted on as-is.
-    pid=insert_pending_limit(a, levels={'entry':entry})
-    if pid is None:
-        return 'ZONE_LIMIT_CHECK', 'Gemini approved the zone but ENABLE_PENDING_LIMITS is off'
-    telegram_send(
-        f'\U0001F440 *LIMIT ORDER PLACED \u2014 {symbol} {a["direction"]}*\n'
-        f'Trade #{pid}\nWatching for fill at `{fmt_price(entry)}`\n'
-        f'Quant Score: `{score:.0f}/100` | Gemini Score: `{gemini_score:.0f}/100`\n'
-        f'SL/TP will be set from the real reaction candle once filled.'
-    )
-    return 'ZONE_LIMIT_CHECK', f'limit order placed at zone (Gemini-approved entry, id={pid})'
-
-
 def scan_once(force=False):
     global LAST_SCAN,LAST_ERROR
     if not scanner_is_active() and not force:
@@ -2965,32 +2989,23 @@ def scan_once(force=False):
                 scan_errors.append((symbol,err))
             time.sleep(1)
 
-        # Hard filters BEFORE watch state. No candidate can enter the state
-        # machine unless the HTF structure and trend regime are valid.
-        eligible=[a for a in analyses if a.get('direction') in ('LONG','SHORT')
-                  and a.get('htf_bias_ok') and a.get('trend_regime_ok')]
+        # Voting gate replaces the old blocking hard filter: `direction`
+        # is only set (in build_analysis) when >=2/3 strategies passed
+        # their own threshold. No separate HTF/trend blocking check here.
+        eligible=[a for a in analyses if a.get('direction') in ('LONG','SHORT')]
 
-        # No multi-scan waiting/state-tracking: each scan decides for
-        # itself, from that scan's own fresh candles. Hard filters already
-        # passed (bias+trend) to be in `eligible` at all.
-        #   score >= MIN_SCORE  -> full setup this cycle -> trigger path
-        #   score <  MIN_SCORE  -> ask Gemini directly (raw candles) if a
-        #                          zone worth a resting limit order is
-        #                          forming here -- NOT gated on quant's own
-        #                          zone detector, Gemini judges from raw data
+        # No multi-scan waiting/state-tracking, no limit-order path: each
+        # scan decides for itself from that scan's own fresh candles. A
+        # symbol reaching `eligible` already cleared the >=2/3 vote --
+        # that vote itself is the gate for going to Gemini.
         watch_notes={}
         triggered=[]
         for a in eligible:
             if has_open_similar(a['symbol'],a['direction']):
                 watch_notes[a['symbol']]=('SKIPPED','similar trade already open/pending')
                 continue
-            if float(a.get('score',0))>=MIN_SCORE:
-                triggered.append(a)
-                watch_notes[a['symbol']]=('READY','full setup this cycle')
-            elif ENABLE_PENDING_LIMITS:
-                watch_notes[a['symbol']]=_try_zone_limit_order(a)
-            else:
-                watch_notes[a['symbol']]=('BELOW_MIN_SCORE','score below MIN_SCORE, pending-limit path disabled')
+            triggered.append(a)
+            watch_notes[a['symbol']]=('READY',f"{a.get('vote_count',0)}/3 strategies passed")
 
         candidates=triggered
         candidates.sort(key=lambda x:float(x.get('score',0)),reverse=True)
@@ -3000,15 +3015,10 @@ def scan_once(force=False):
             con=db(); now=now_utc()
             for a in analyses:
                 if a not in eligible:
-                    missing=[]
-                    if not a.get('direction') in ('LONG','SHORT'):
-                        missing.append('direction')
-                    if not a.get('htf_bias_ok'):
-                        missing.append('htf_bias')
-                    if not a.get('trend_regime_ok'):
-                        missing.append('trend_regime')
-                    decision='HARD_FILTER_FAIL'
-                    reason='Failed: '+', '.join(missing)
+                    votes=a.get('strategy_scores') or {}
+                    decision='NO_TRADE'
+                    reason=(f"<2/3 strategies passed (SMC/Trend/MeanRev scores unavailable)"
+                            if not votes else f"<2/3 strategies passed")
                 else:
                     status,note=watch_notes.get(a['symbol'],('ELIGIBLE','eligible'))
                     decision=f'WATCHING_{status}'
@@ -3025,8 +3035,6 @@ def scan_once(force=False):
         # Try the best N candidates. If #1 is rejected, #2 gets a fair chance.
         for rank,best in enumerate(candidates[:MAX_GEMINI_CANDIDATES],1):
             best_symbol=best['symbol']; best_score=float(best['score'])
-            if best_score < MIN_SCORE:
-                continue
             if has_open_similar(best_symbol,best['direction']) or has_recent_loss(best_symbol):
                 continue
 
@@ -3091,209 +3099,6 @@ def insert_trade(a,ai):
         )
         con.commit(); con.close()
     return tid
-
-def insert_pending_limit(a, levels=None):
-    """A limit-order 'watch' -- created once a good-scoring setup reaches
-    its 15M zone (ZONE_REACHED) AND Gemini has independently approved the
-    zone itself (see gemini_validate_zone), rather than waiting for the
-    full 5M sweep/BOS/CHoCH trigger. Avoids "chasing" an extended move
-    (Gemini's #1 rejection reason on the trigger path) by construction --
-    the order just rests at the zone.
-    `levels`, when given, overrides entry/sl/tp1/2/3 with Gemini's own
-    zone-stage numbers (already structure-verified by
-    _validate_and_correct_gemini_levels); falls back to quant's own `a`
-    levels only if no override is supplied (legacy/manual-call path).
-    Gated on ENABLE_PENDING_LIMITS (off by default) -- never included in
-    MARKET_GEMINI factor statistics; tagged with its own trade_type."""
-    if not ENABLE_PENDING_LIMITS:
-        return None
-    lv=levels or {}
-    entry=lv.get('entry') or a.get('zone_entry') or a.get('entry')
-    # `sl`/`tp1-3` here are ONLY a provisional DB-constraint placeholder
-    # (NOT NULL columns) -- they get FULLY overwritten at fill from real
-    # fill-time structure. NEVER derive R-multipliers from them: quant's
-    # own sl/tp1-3 are anchored to quant's OWN entry price (a['entry'],
-    # the current price when it scanned), which can be a materially
-    # different number from Gemini's zone `entry` here. Computing
-    # abs(quant_tp - gemini_entry)/abs(gemini_entry - quant_sl) mixes two
-    # unrelated reference points and produces a distorted, sometimes wild
-    # ratio (this was producing multi-thousand-point "boring" TPs that
-    # bore no relation to the real fill-time risk). When only `entry` is
-    # supplied (the zone-limit path), leave multipliers empty so
-    # track_pending_limits() uses its own safe defaults (1.5/2.3/3.2R)
-    # applied to the REAL risk computed at fill time.
-    sl=lv.get('sl', a.get('sl')); tp1=lv.get('tp1', a.get('tp1')); tp2=lv.get('tp2', a.get('tp2')); tp3=lv.get('tp3', a.get('tp3'))
-    if all(k in lv for k in ('sl','tp1','tp2','tp3')):
-        risk_orig=abs(entry-lv['sl']) or 1e-9
-        multipliers={
-            'tp1': abs(lv['tp1']-entry)/risk_orig,
-            'tp2': abs(lv['tp2']-entry)/risk_orig,
-            'tp3': abs(lv['tp3']-entry)/risk_orig,
-        }
-    else:
-        multipliers={}
-    factors_json=json.dumps({'quant': a.get('factor_flags', {}), 'quant_score': a.get('score'),
-                              'structure_levels': a.get('structure_levels', {}),
-                              'gemini_zone_validated': bool(levels),
-                              'note': 'pending_limit -- zone confirmed by Gemini' if levels
-                                      else 'pending_limit -- no Gemini call'})
-    with DB_LOCK:
-        con=db(); cur=con.execute('''INSERT INTO trades(symbol,direction,entry,sl,tp1,tp2,tp3,score,ai_confidence,ai_reason,framework,created_at,factors_json,effective_sl,pending_multipliers_json,status)
-                                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-          (a['symbol'],a['direction'],entry,sl,tp1,tp2,tp3,a['score'],0,
-           'Limit order watch -- Gemini-approved zone, SL/TP refined at fill from the real sweep candle' if levels
-           else 'Limit order watch -- SL/TP provisional, refined at fill from the real sweep candle',
-           FRAMEWORK,now_utc(),factors_json,sl,json.dumps(multipliers),'PENDING_LIMIT'))
-        con.execute("UPDATE trades SET trade_type=? WHERE id=?",
-                     ('LIMIT_GEMINI_ZONE' if levels else 'LIMIT_QUANT', cur.lastrowid))
-        con.commit(); tid=cur.lastrowid; con.close()
-    return tid
-
-def _check_zone_retest(symbol, direction, entry, zone_low, zone_high):
-    """Checks the most recent CLOSED 5M candle for a genuine RETEST of the
-    15M zone noted when this limit order was approved -- price must have
-    wicked into the zone AND closed back on the correct side (a real
-    rejection), not just mechanically touched the entry price. Same
-    sweep-confirmation shape used elsewhere in this file (wick beyond a
-    level, close back through it), applied here to the specific zone that
-    justified this order.
-    Returns (confirmed: bool, retest_candle: dict|None).
-    """
-    struct_tf=TIMEFRAMES[2]
-    try:
-        c5=fetch_klines(symbol,struct_tf,10)
-    except Exception:
-        return False,None
-    closed=[x for x in c5 if _candle_is_closed(x,struct_tf)]
-    if not closed:
-        return False,None
-    last=closed[-1]
-    lo=zone_low if zone_low is not None else entry
-    hi=zone_high if zone_high is not None else entry
-    if direction=='LONG':
-        touched=last['low']<=hi
-        rejected=last['close']>=lo
-        bullish_close=last['close']>last['open']
-        confirmed=touched and rejected and bullish_close
-    else:
-        touched=last['high']>=lo
-        rejected=last['close']<=hi
-        bearish_close=last['close']<last['open']
-        confirmed=touched and rejected and bearish_close
-    return confirmed,(last if confirmed else None)
-
-
-def track_pending_limits():
-    if not ENABLE_PENDING_LIMITS:
-        return
-    with DB_LOCK:
-        con=db(); rows=con.execute("SELECT * FROM trades WHERE status='PENDING_LIMIT'").fetchall(); con.close()
-    for row in rows:
-        try:
-            if PENDING_LIMIT_TIMEOUT_MIN>0:
-                age=_minutes_since(row['created_at'])
-                if age is not None and age>PENDING_LIMIT_TIMEOUT_MIN:
-                    with DB_LOCK:
-                        con=db(); con.execute(
-                            "UPDATE trades SET status='CLOSED',final_result='EXPIRED_NO_ENTRY',close_time=? WHERE id=?",
-                            (now_utc(),row['id'])
-                        ); con.commit(); con.close()
-                    telegram_send(
-                        f'\u231B *LIMIT ORDER EXPIRED \u2014 {row["symbol"]} {row["direction"]}*\n'
-                        f'Trade #{row["id"]}\nZone `{fmt_price(row["entry"])}` never filled within '
-                        f'{PENDING_LIMIT_TIMEOUT_MIN}min -- cancelled.'
-                    )
-                    continue
-            entry=float(row['entry'])
-            direction=row['direction']
-            try:
-                stored_struct=json.loads(row['factors_json'] or '{}').get('structure_levels',{})
-            except Exception:
-                stored_struct={}
-            zone_low=stored_struct.get('zone_low'); zone_high=stored_struct.get('zone_high')
-
-            # Not a mechanical "price touched the entry price" fill: the
-            # 15M zone was noted at approval time, and the order only
-            # triggers once the 5M shows a genuine RETEST -- price wicks
-            # into the zone AND closes back on the correct side (a real
-            # rejection), same confirmation pattern used for sweeps
-            # elsewhere. A bare touch with no reaction is not a trigger.
-            confirmed,c=_check_zone_retest(row['symbol'],direction,entry,zone_low,zone_high)
-            if not confirmed:
-                continue
-
-            # Structural SL at fill: the SETUP itself is a 15M zone (POI) --
-            # its own boundary (already known BEFORE fill, from the same
-            # zone that justified this order) is the real invalidation
-            # point for this thesis. Prefer that over a fresh 5M-candle
-            # "sweep" computed right at the moment of fill, which can just
-            # be the approach into the zone, not a confirmed reaction yet.
-            struct_tf=TIMEFRAMES[2]
-            struct_c=fetch_klines(row['symbol'],struct_tf,30)
-            a_atr=stored_struct.get('atr_5m') or (atr(struct_c) if struct_c else abs(entry-row['sl'])*0.3)
-            try:
-                mult=json.loads(row['pending_multipliers_json'] or '{}')
-            except Exception:
-                mult={}
-            m1,m2,m3=mult.get('tp1',1.5),mult.get('tp2',2.3),mult.get('tp3',3.2)
-            if direction=='LONG':
-                if zone_low is not None:
-                    structural=zone_low
-                elif struct_c:
-                    structural=min(x['low'] for x in struct_c[-3:])
-                else:
-                    structural=c['low']
-                new_sl=min(structural-0.25*a_atr,entry-0.60*a_atr)
-                risk=entry-new_sl
-                tps=(entry+m1*risk,entry+m2*risk,entry+m3*risk)
-            else:
-                if zone_high is not None:
-                    structural=zone_high
-                elif struct_c:
-                    structural=max(x['high'] for x in struct_c[-3:])
-                else:
-                    structural=c['high']
-                new_sl=max(structural+0.25*a_atr,entry+0.60*a_atr)
-                risk=new_sl-entry
-                tps=(entry-m1*risk,entry-m2*risk,entry-m3*risk)
-
-            # Fill is real now: OPEN, not WAITING_ENTRY. Process the same candle
-            # using the conservative intrabar policy.
-            pseudo=dict(row)
-            pseudo.update({
-                'status':'OPEN','entry':entry,'sl':new_sl,'effective_sl':new_sl,
-                'tp1':tps[0],'tp2':tps[1],'tp3':tps[2],'highest_tp':0
-            })
-            u=check_trade(pseudo,c)
-            if u is None:
-                u={'status':'OPEN','effective_sl':new_sl,'entry_time':now_utc(),
-                   'entry_fill_time':now_utc()}
-            else:
-                u.setdefault('entry_time',now_utc())
-                u['entry_fill_time']=now_utc()
-
-            with DB_LOCK:
-                con=db()
-                sets={'sl':new_sl,'effective_sl':u.get('effective_sl',new_sl),
-                      'tp1':tps[0],'tp2':tps[1],'tp3':tps[2],
-                      'status':u.get('status','OPEN'),'entry_time':u.get('entry_time',now_utc()),
-                      'entry_fill_time':now_utc(),'ai_reason':'Experimental limit filled; same candle processed'}
-                sets.update({k:v for k,v in u.items() if k in (
-                    'highest_tp','tp1_hit','tp2_hit','tp3_hit','sl_hit','final_result',
-                    'close_time','intrabar_ambiguous','realized_r')})
-                sql=', '.join(f'{k}=?' for k in sets)
-                con.execute(f'UPDATE trades SET {sql} WHERE id=?',list(sets.values())+[row['id']])
-                con.commit(); con.close()
-
-            telegram_send(
-                f'\U0001F3AF *LIMIT ORDER FILLED \u2014 {row["symbol"]} {direction}*\n'
-                f'Trade #{row["id"]}\n'
-                f'Entry: `{fmt_price(entry)}`\n'
-                f'SL: `{fmt_price(new_sl)}` (set from the real sweep candle)\n'
-                f'TP1: `{fmt_price(tps[0])}` | TP2: `{fmt_price(tps[1])}` | TP3: `{fmt_price(tps[2])}`'
-            )
-        except Exception as e:
-            log.warning('pending-limit tracker %s: %s',row['symbol'],e)
 
 def _compute_realized_r(direction,entry,sl,tp3,eff_sl,result):
     risk=abs(entry-sl)
@@ -3574,10 +3379,6 @@ def send_trade_summary():
     )
 
 # Disable the old limit path unless explicitly requested.
-if not ENABLE_PENDING_LIMITS:
-    PENDING_LIMIT_MIN_SCORE=101
-else:
-    PENDING_LIMIT_MIN_SCORE=max(0,int(os.getenv('PENDING_LIMIT_MIN_SCORE','53')))
 
 # ----------------------------- Startup --------------------------------
 init_db()
