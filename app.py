@@ -1554,7 +1554,8 @@ def track_trades():
                 sets=', '.join(f'{k}=?' for k in u); con.execute(f'UPDATE trades SET {sets},last_price=?,last_checked=? WHERE id=?',list(u.values())+[last_closed['close'],now_utc(),row['id']]); con.commit(); con.close()
             if u.get('status')=='CLOSED':
                 result=u.get('final_result','CLOSED'); icon='🟢' if result=='TP3_WIN' else '🟡' if 'TP' in result else '🔴'
-                telegram_send(f'{icon} *TRADE CLOSED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\nResult: *{result}*\nEntry: `{fmt_price(row["entry"])}` | SL: `{fmt_price(row["sl"])}`\nTP1: `{fmt_price(row["tp1"])}` | TP2: `{fmt_price(row["tp2"])}` | TP3: `{fmt_price(row["tp3"])}`')
+                close_ts=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                telegram_send(f'{icon} *TRADE CLOSED — {row["symbol"]} {row["direction"]}*\nTrade #{row["id"]}\nResult: *{result}*\nEntry: `{fmt_price(row["entry"])}` | SL: `{fmt_price(row["sl"])}`\nTP1: `{fmt_price(row["tp1"])}` | TP2: `{fmt_price(row["tp2"])}` | TP3: `{fmt_price(row["tp3"])}`\n⏰ {close_ts}')
             elif new_eff_sl is not None and new_eff_sl != old_eff_sl:
                 # Stop just ratcheted forward (TP1 -> breakeven, TP2 -> TP1) on a
                 # trade that's still running -- tell the user their risk on this
@@ -2490,11 +2491,21 @@ Return ONLY JSON:
     return gemini_json(system,prompt,max_output_tokens=1800)
 
 def _validate_and_correct_gemini_levels(best, ai):
-    """Shared APPROVE/REJECT + SL-structure-correction pipeline for any
-    Gemini validation result against a quant candidate `best`. Used by both
-    the full-trigger approval path and the pre-trigger zone-limit path so
-    the same direction/structure-agreement/SL-verification rules apply
-    everywhere a Gemini result gets turned into a trade.
+    """Shared APPROVE/REJECT + SL/TP-reconciliation pipeline for any Gemini
+    validation result against a quant candidate `best`. Gemini does NOT get
+    sole authority over the final trade levels: quant already computed its
+    OWN entry/sl/tp1-3 for this candidate (in build_analysis), independent
+    of Gemini. The two are compared:
+      - If they CONVERGE (within SL_STRUCTURE_TOLERANCE_ATR of each other)
+        -> use the AVERAGED levels (agreement between two independent
+        methods), not either one blindly.
+      - If they DISAGREE -> Gemini's numbers are not trusted as-is; fall
+        back to quant's OWN structurally-computed levels instead.
+      - If quant has no SL to compare (shouldn't normally happen) -> fall
+        back to the structural-reference check/auto-correction as before.
+    A Gemini REJECT is still honored as a real signal (that part of its
+    independent judgement is respected) -- only the raw SL/TP NUMBERS are
+    never taken on faith.
     Returns (approved, trade_plan, reason, gemini_score).
     """
     try:
@@ -2527,27 +2538,41 @@ def _validate_and_correct_gemini_levels(best, ai):
                 if not ok:
                     reason=why
                 else:
-                    sl_ok,sl_why,nearest_ref=_verify_sl_against_structure(
-                        g_direction,g_sl,best.get('structure_levels',{})
-                    )
-                    if sl_ok:
-                        final_sl,final_tp1,final_tp2,final_tp3=g_sl,g_tp1,g_tp2,g_tp3
-                        level_note=sl_why
-                    elif nearest_ref is not None:
-                        atrv=best.get('structure_levels',{}).get('atr_5m') or abs(g_entry)*0.005
-                        final_sl,final_tp1,final_tp2,final_tp3=_correct_sl_to_structure(
-                            g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3,nearest_ref,atrv
-                        )
-                        level_note=f'SL auto-corrected to structure ({sl_why})'
+                    atrv=best.get('structure_levels',{}).get('atr_5m') or abs(g_entry)*0.005
+                    q_sl=best.get('sl'); q_tp1=best.get('tp1'); q_tp2=best.get('tp2'); q_tp3=best.get('tp3')
+                    if q_sl is not None:
+                        gap_atr=abs(g_sl-q_sl)/max(atrv,1e-9)
+                        if gap_atr<=SL_STRUCTURE_TOLERANCE_ATR:
+                            final_sl=(g_sl+q_sl)/2
+                            final_tp1=(g_tp1+q_tp1)/2 if q_tp1 is not None else g_tp1
+                            final_tp2=(g_tp2+q_tp2)/2 if q_tp2 is not None else g_tp2
+                            final_tp3=(g_tp3+q_tp3)/2 if q_tp3 is not None else g_tp3
+                            level_note=f'Quant/Gemini SL converge ({gap_atr:.2f} ATR apart) -- using averaged levels'
+                        else:
+                            final_sl,final_tp1,final_tp2,final_tp3=q_sl,q_tp1,q_tp2,q_tp3
+                            level_note=(f'Quant/Gemini SL disagree ({gap_atr:.2f} ATR apart, '
+                                        f'tolerance {SL_STRUCTURE_TOLERANCE_ATR}) -- using quant\'s own levels')
                     else:
-                        final_sl=None; level_note=sl_why
+                        sl_ok,sl_why,nearest_ref=_verify_sl_against_structure(
+                            g_direction,g_sl,best.get('structure_levels',{})
+                        )
+                        if sl_ok:
+                            final_sl,final_tp1,final_tp2,final_tp3=g_sl,g_tp1,g_tp2,g_tp3
+                            level_note=sl_why
+                        elif nearest_ref is not None:
+                            final_sl,final_tp1,final_tp2,final_tp3=_correct_sl_to_structure(
+                                g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3,nearest_ref,atrv
+                            )
+                            level_note=f'SL auto-corrected to structure ({sl_why})'
+                        else:
+                            final_sl=None; level_note=sl_why
 
                     if final_sl is None:
-                        reason=f'SL structure check failed, no structural reference to correct to: {sl_why}'
+                        reason=f'SL structure check failed, no structural reference to correct to: {level_note}'
                     else:
                         ok2,why2=_final_level_check(g_direction,g_entry,final_sl,final_tp1,final_tp2,final_tp3)
                         if not ok2:
-                            reason=f'SL-corrected levels still invalid: {why2} ({level_note})'
+                            reason=f'Reconciled levels still invalid: {why2} ({level_note})'
                         else:
                             trade_plan=dict(best)
                             trade_plan.update({
