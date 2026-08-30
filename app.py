@@ -170,8 +170,39 @@ PORT = int(os.getenv('PORT', '10000'))
 BINANCE_BASE = os.getenv('BINANCE_BASE', 'https://fapi.binance.com')
 BYBIT_BASE = os.getenv('BYBIT_BASE', 'https://api.bybit.com')
 MEXC_BASE = os.getenv('MEXC_BASE', 'https://api.mexc.com')
-EXCHANGE_ORDER = [x.strip().lower() for x in os.getenv('EXCHANGE_ORDER', 'binance,bybit,mexc').split(',') if x.strip()]
+EXCHANGE_ORDER = [x.strip().lower() for x in os.getenv('EXCHANGE_ORDER', 'mexc').split(',') if x.strip()]
 WATCHLIST = [x.strip().upper() for x in os.getenv('WATCHLIST', 'BTCUSDT,ETHUSDT,SOLUSDT').split(',') if x.strip()]
+# Dynamic watchlist: instead of a fixed coin list, scan the top-N USDT
+# perpetuals on MEXC by 24h quote volume every scan cycle. Falls back to
+# the static WATCHLIST above only if this fetch fails.
+USE_TOP_COINS = os.getenv('USE_TOP_COINS', '1').strip().lower() in ('1','true','yes','on')
+TOP_N_COINS = max(1, int(os.getenv('TOP_N_COINS', '35')))
+TOP_COINS_REFRESH_MIN = max(1, int(os.getenv('TOP_COINS_REFRESH_MIN', '15')))
+_TOP_COINS_CACHE={'list':[], 'ts':0.0}
+
+def fetch_top_symbols(n=None):
+    """Top-N USDT perpetuals on MEXC by 24h quote volume (amount24),
+    refreshed at most once every TOP_COINS_REFRESH_MIN minutes. Falls back
+    to the cached list (or the static WATCHLIST if the cache is empty) on
+    any fetch error, rather than ever returning nothing to scan."""
+    n=n or TOP_N_COINS
+    now=time.monotonic()
+    if _TOP_COINS_CACHE['list'] and now-_TOP_COINS_CACHE['ts']<TOP_COINS_REFRESH_MIN*60:
+        return _TOP_COINS_CACHE['list'][:n]
+    try:
+        r=requests.get(f'{MEXC_BASE}/api/v1/contract/ticker', timeout=20)
+        r.raise_for_status()
+        payload=r.json()
+        rows=payload.get('data') or []
+        usdt_rows=[row for row in rows if str(row.get('symbol','')).endswith('_USDT')]
+        usdt_rows.sort(key=lambda row: float(row.get('amount24') or 0), reverse=True)
+        symbols=[row['symbol'].replace('_USDT','USDT') for row in usdt_rows[:n]]
+        if symbols:
+            _TOP_COINS_CACHE['list']=symbols; _TOP_COINS_CACHE['ts']=now
+            return symbols
+    except Exception as exc:
+        log.warning('[TOP_COINS] fetch failed: %s', exc)
+    return _TOP_COINS_CACHE['list'][:n] if _TOP_COINS_CACHE['list'] else WATCHLIST
 FRAMEWORK = os.getenv('FRAMEWORK', '1h_15m_5m')
 SCAN_INTERVAL = max(5, int(os.getenv('SCAN_INTERVAL_MINUTES', '15')))
 TRACK_INTERVAL = max(1, int(os.getenv('TRACK_INTERVAL_MINUTES', '1')))
@@ -2490,101 +2521,94 @@ Return ONLY JSON:
 }"""
     return gemini_json(system,prompt,max_output_tokens=1800)
 
-def _validate_and_correct_gemini_levels(best, ai):
-    """Shared APPROVE/REJECT + SL/TP-reconciliation pipeline for any Gemini
-    validation result against a quant candidate `best`. Gemini does NOT get
-    sole authority over the final trade levels: quant already computed its
-    OWN entry/sl/tp1-3 for this candidate (in build_analysis), independent
-    of Gemini. The two are compared:
-      - If they CONVERGE (within SL_STRUCTURE_TOLERANCE_ATR of each other)
-        -> use the AVERAGED levels (agreement between two independent
-        methods), not either one blindly.
-      - If they DISAGREE -> Gemini's numbers are not trusted as-is; fall
-        back to quant's OWN structurally-computed levels instead.
-      - If quant has no SL to compare (shouldn't normally happen) -> fall
-        back to the structural-reference check/auto-correction as before.
-    A Gemini REJECT is still honored as a real signal (that part of its
-    independent judgement is respected) -- only the raw SL/TP NUMBERS are
-    never taken on faith.
-    Returns (approved, trade_plan, reason, gemini_score).
+def _resolve_trade_levels(best, ai):
+    """Once a candidate has passed the >=2/3 strategy vote, a trade WILL
+    happen -- Gemini is a second opinion for CALIBRATING SL/TP, not a
+    gatekeeper with veto power. This always returns a usable trade_plan,
+    falling back to quant's own independently-computed entry/sl/tp1-3
+    whenever Gemini's input can't be trusted or used for any reason
+    (REJECT, direction mismatch, weak structure agreement, missing/
+    invalid levels, or the numbers simply disagreeing with quant's own).
+    Returns (trade_plan, note, gemini_score).
     """
     try:
         gemini_score=float(ai.get('score',ai.get('confidence',0)) or 0)
     except (TypeError,ValueError):
         gemini_score=0.0
 
-    approved=False; trade_plan=None
-    reason=ai.get('reason') or (
-        'Gemini response was truncated before a reason could be captured '
-        '(consider raising max_output_tokens if this repeats)'
-        if ai.get('_truncated_reject') else 'Gemini rejected (no reason given)'
-    )
-    if str(ai.get('decision','REJECT')).upper()=='APPROVE' and gemini_score>=GEMINI_MIN_SCORE:
-        positive,checked,agreement=structure_agreement(best.get('factor_flags',{}),ai)
-        g_direction=str(ai.get('direction') or '').upper()
-        if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
-            reason='Gemini direction disagrees with quant direction'
-        elif checked>=3 and (positive<MIN_STRUCTURE_AGREEMENTS or agreement<MAX_STRUCTURE_DISAGREEMENT):
-            reason=(f'Insufficient positive structure agreement: '
-                    f'{positive} positive / {checked} checked, ratio={agreement:.2f}')
+    def _quant_fallback(note):
+        plan=dict(best)
+        plan.update({'rr':abs(best['tp2']-best['entry'])/max(abs(best['entry']-best['sl']),1e-12)})
+        return plan, note, gemini_score
+
+    if str(ai.get('decision','REJECT')).upper()!='APPROVE' or gemini_score<GEMINI_MIN_SCORE:
+        why=ai.get('reason') or (
+            'Gemini response was truncated before a reason could be captured'
+            if ai.get('_truncated_reject') else 'Gemini rejected (no reason given)'
+        )
+        return _quant_fallback(f"Gemini did not approve ({why}) -- trade proceeds on quant's own levels (vote already passed)")
+
+    g_direction=str(ai.get('direction') or '').upper()
+    if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
+        return _quant_fallback("Gemini direction disagreed with quant -- trade proceeds on quant's own direction/levels")
+
+    positive,checked,agreement=structure_agreement(best.get('factor_flags',{}),ai)
+    if checked>=3 and (positive<MIN_STRUCTURE_AGREEMENTS or agreement<MAX_STRUCTURE_DISAGREEMENT):
+        return _quant_fallback(f"Weak structure agreement with Gemini ({positive}/{checked}, ratio={agreement:.2f}) "
+                                "-- trade proceeds on quant's own levels")
+
+    try:
+        vals=[float(ai[k]) for k in ('entry','sl','tp1','tp2','tp3')]
+        g_entry,g_sl,g_tp1,g_tp2,g_tp3=vals
+    except (KeyError,TypeError,ValueError):
+        return _quant_fallback("Gemini approval missing valid trade levels -- trade proceeds on quant's own levels")
+
+    ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
+    if not ok:
+        return _quant_fallback(f"Gemini's own levels failed sanity check ({why}) -- trade proceeds on quant's own levels")
+
+    # Gemini's proposal is internally valid -- now reconcile against
+    # quant's OWN independently-computed levels (this is the actual
+    # "figure out which SL/TP is correct" step, not a veto).
+    atrv=best.get('structure_levels',{}).get('atr_5m') or abs(g_entry)*0.005
+    q_sl=best.get('sl'); q_tp1=best.get('tp1'); q_tp2=best.get('tp2'); q_tp3=best.get('tp3')
+    if q_sl is not None:
+        gap_atr=abs(g_sl-q_sl)/max(atrv,1e-9)
+        if gap_atr<=SL_STRUCTURE_TOLERANCE_ATR:
+            final_sl=(g_sl+q_sl)/2
+            final_tp1=(g_tp1+q_tp1)/2 if q_tp1 is not None else g_tp1
+            final_tp2=(g_tp2+q_tp2)/2 if q_tp2 is not None else g_tp2
+            final_tp3=(g_tp3+q_tp3)/2 if q_tp3 is not None else g_tp3
+            note=f'Quant/Gemini SL converge ({gap_atr:.2f} ATR apart) -- using averaged levels'
         else:
-            try:
-                vals=[float(ai[k]) for k in ('entry','sl','tp1','tp2','tp3')]
-                g_entry,g_sl,g_tp1,g_tp2,g_tp3=vals
-            except (KeyError,TypeError,ValueError):
-                reason='Gemini approval missing valid trade levels'
-            else:
-                ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
-                if not ok:
-                    reason=why
-                else:
-                    atrv=best.get('structure_levels',{}).get('atr_5m') or abs(g_entry)*0.005
-                    q_sl=best.get('sl'); q_tp1=best.get('tp1'); q_tp2=best.get('tp2'); q_tp3=best.get('tp3')
-                    if q_sl is not None:
-                        gap_atr=abs(g_sl-q_sl)/max(atrv,1e-9)
-                        if gap_atr<=SL_STRUCTURE_TOLERANCE_ATR:
-                            final_sl=(g_sl+q_sl)/2
-                            final_tp1=(g_tp1+q_tp1)/2 if q_tp1 is not None else g_tp1
-                            final_tp2=(g_tp2+q_tp2)/2 if q_tp2 is not None else g_tp2
-                            final_tp3=(g_tp3+q_tp3)/2 if q_tp3 is not None else g_tp3
-                            level_note=f'Quant/Gemini SL converge ({gap_atr:.2f} ATR apart) -- using averaged levels'
-                        else:
-                            final_sl,final_tp1,final_tp2,final_tp3=q_sl,q_tp1,q_tp2,q_tp3
-                            level_note=(f'Quant/Gemini SL disagree ({gap_atr:.2f} ATR apart, '
-                                        f'tolerance {SL_STRUCTURE_TOLERANCE_ATR}) -- using quant\'s own levels')
-                    else:
-                        sl_ok,sl_why,nearest_ref=_verify_sl_against_structure(
-                            g_direction,g_sl,best.get('structure_levels',{})
-                        )
-                        if sl_ok:
-                            final_sl,final_tp1,final_tp2,final_tp3=g_sl,g_tp1,g_tp2,g_tp3
-                            level_note=sl_why
-                        elif nearest_ref is not None:
-                            final_sl,final_tp1,final_tp2,final_tp3=_correct_sl_to_structure(
-                                g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3,nearest_ref,atrv
-                            )
-                            level_note=f'SL auto-corrected to structure ({sl_why})'
-                        else:
-                            final_sl=None; level_note=sl_why
+            final_sl,final_tp1,final_tp2,final_tp3=q_sl,q_tp1,q_tp2,q_tp3
+            note=(f'Quant/Gemini SL disagree ({gap_atr:.2f} ATR apart, tolerance {SL_STRUCTURE_TOLERANCE_ATR}) '
+                  "-- using quant's own levels")
+    else:
+        sl_ok,sl_why,nearest_ref=_verify_sl_against_structure(g_direction,g_sl,best.get('structure_levels',{}))
+        if sl_ok:
+            final_sl,final_tp1,final_tp2,final_tp3=g_sl,g_tp1,g_tp2,g_tp3
+            note=sl_why
+        elif nearest_ref is not None:
+            final_sl,final_tp1,final_tp2,final_tp3=_correct_sl_to_structure(
+                g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3,nearest_ref,atrv
+            )
+            note=f'SL auto-corrected to structure ({sl_why})'
+        else:
+            return _quant_fallback(f"Gemini SL failed structure check with no reference to correct to ({sl_why}) "
+                                    "-- trade proceeds on quant's own levels")
 
-                    if final_sl is None:
-                        reason=f'SL structure check failed, no structural reference to correct to: {level_note}'
-                    else:
-                        ok2,why2=_final_level_check(g_direction,g_entry,final_sl,final_tp1,final_tp2,final_tp3)
-                        if not ok2:
-                            reason=f'Reconciled levels still invalid: {why2} ({level_note})'
-                        else:
-                            trade_plan=dict(best)
-                            trade_plan.update({
-                                'direction':g_direction,'entry':g_entry,'sl':final_sl,
-                                'tp1':final_tp1,'tp2':final_tp2,'tp3':final_tp3,
-                                'rr':abs(final_tp2-g_entry)/max(abs(g_entry-final_sl),1e-12)
-                            })
-                            approved=True
-                            reason=ai.get('reason',why)+f' | {level_note}'
-    return approved, trade_plan, reason, gemini_score
+    ok2,why2=_final_level_check(g_direction,g_entry,final_sl,final_tp1,final_tp2,final_tp3)
+    if not ok2:
+        return _quant_fallback(f"Reconciled levels failed sanity check ({why2}) -- trade proceeds on quant's own levels")
 
-
+    trade_plan=dict(best)
+    trade_plan.update({
+        'direction':g_direction,'entry':g_entry,'sl':final_sl,
+        'tp1':final_tp1,'tp2':final_tp2,'tp3':final_tp3,
+        'rr':abs(final_tp2-g_entry)/max(abs(g_entry-final_sl),1e-12)
+    })
+    return trade_plan, ai.get('reason','')+f' | {note}', gemini_score
 def _adx(candles, n=14):
     """Wilder's ADX -- direction-agnostic trend-STRENGTH (0-100). Used by
     the Trend-Following strategy's 1H component."""
@@ -2999,7 +3023,9 @@ def scan_once(force=False):
         if count_open_trades() >= MAX_CONCURRENT_TRADES:
             result['status']=f'max concurrent trades reached ({MAX_CONCURRENT_TRADES})'
             return result
-        for symbol in WATCHLIST:
+        scan_symbols=fetch_top_symbols() if USE_TOP_COINS else WATCHLIST
+        result['scan_symbols']=scan_symbols
+        for symbol in scan_symbols:
             try:
                 a=build_analysis(symbol)
                 analyses.append(a)
@@ -3057,7 +3083,11 @@ def scan_once(force=False):
         if not candidates:
             return result
 
-        # Try the best N candidates. If #1 is rejected, #2 gets a fair chance.
+        # Voting (>=2/3 strategies) already decided a trade WILL happen for
+        # the top candidate that isn't blocked by an open/recent-loss
+        # skip -- Gemini is consulted to help calibrate SL/TP, not to
+        # veto the trade. If Gemini can't be reached at all, quant's own
+        # independently-computed levels are used directly.
         for rank,best in enumerate(candidates[:MAX_GEMINI_CANDIDATES],1):
             best_symbol=best['symbol']; best_score=float(best['score'])
             if has_open_similar(best_symbol,best['direction']) or has_recent_loss(best_symbol):
@@ -3066,42 +3096,36 @@ def scan_once(force=False):
             try:
                 ai=gemini_validate(best)
             except Exception as exc:
-                reason=f'Gemini error: {type(exc).__name__}: {exc}'
-                with DB_LOCK:
-                    con=db()
-                    con.execute(
-                        'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
-                        (now_utc(),best_symbol,best_score,'GEMINI_ERROR',1,reason)
-                    )
-                    con.commit(); con.close()
-                continue
+                ai={}
+                gemini_note=f'Gemini unreachable ({type(exc).__name__}: {exc}) -- trade proceeds on quant\'s own levels'
+                trade_plan=dict(best)
+                trade_plan.update({'rr':abs(best['tp2']-best['entry'])/max(abs(best['entry']-best['sl']),1e-12)})
+                gemini_score=0.0
+            else:
+                trade_plan,gemini_note,gemini_score=_resolve_trade_levels(best,ai)
 
-            approved,trade_plan,reason,gemini_score=_validate_and_correct_gemini_levels(best,ai)
-
-            decision='APPROVED' if approved else 'REJECTED'
             with DB_LOCK:
                 con=db()
                 con.execute(
                     'INSERT INTO scans(time,symbol,score,decision,gemini_called,reason) VALUES(?,?,?,?,?,?)',
-                    (now_utc(),best_symbol,best_score,decision,1,
+                    (now_utc(),best_symbol,best_score,'APPROVED',1,
                      f'[candidate {rank}/{min(MAX_GEMINI_CANDIDATES,len(candidates))}] '
-                     f'[Gemini {gemini_score:.0f}] {reason}')
+                     f'[Gemini {gemini_score:.0f}] {gemini_note}')
                 )
                 con.commit(); con.close()
 
             result['symbols'][best_symbol].update({
-                'decision':decision,'gemini':True,'ai':ai,
-                'gemini_score':gemini_score,'reason':reason
+                'decision':'APPROVED','gemini':True,'ai':ai,
+                'gemini_score':gemini_score,'reason':gemini_note
             })
 
-            if approved:
-                tid=insert_trade(trade_plan,ai)
-                result['best']={'symbol':best_symbol,'score':best_score,'trade_id':tid}
-                telegram_send(
-                    build_signal_card(trade_plan,ai,best,best_score,gemini_score),
-                    parse_mode=None
-                )
-                return result
+            tid=insert_trade(trade_plan,ai)
+            result['best']={'symbol':best_symbol,'score':best_score,'trade_id':tid}
+            telegram_send(
+                build_signal_card(trade_plan,ai,best,best_score,gemini_score),
+                parse_mode=None
+            )
+            return result
 
         return result
     finally:
