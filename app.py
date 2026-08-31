@@ -2030,51 +2030,148 @@ def api_reset():
 def dashboard():
     s=stats()
     with DB_LOCK:
-        con=db(); trades=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status!='PENDING_LIMIT' ORDER BY id DESC LIMIT 50").fetchall()]
-        pending=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='PENDING_LIMIT' ORDER BY id DESC LIMIT 30").fetchall()]
+        con=db()
+        trades=[dict(x) for x in con.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50").fetchall()]
         scans=[dict(x) for x in con.execute('SELECT * FROM scans ORDER BY id DESC LIMIT 30').fetchall()]; con.close()
-    rows=''.join(f'<tr><td>#{t["id"]}</td><td>{t["symbol"]}</td><td>{t["direction"]}</td><td>{t["score"]}</td><td>{t["status"]}</td><td>{t["highest_tp"] or 0}</td><td>{t["final_result"] or "—"}</td></tr>' for t in trades)
-    pendrows=''.join(
-        f'<tr><td>#{p["id"]}</td><td>{p["symbol"]}</td><td>{p["direction"]}</td><td>{p["score"]}</td>'
-        f'<td>{fmt_price(p["entry"])}</td><td>{p["created_at"]}</td></tr>' for p in pending
-    )
-    scanrows=''.join(f'<tr><td>{x["time"]}</td><td>{x["symbol"]}</td><td>{x["score"]}</td><td>{x["decision"]}</td><td>{"YES" if x["gemini_called"] else "NO"}</td><td>{x["reason"] or "—"}</td></tr>' for x in scans)
+    def _status_badge(status, result):
+        if status=='CLOSED':
+            r=result or ''
+            cls='win' if r=='TP3_WIN' else ('loss' if r=='SL_LOSS' else 'partial')
+            label=r.replace('_',' ') if r else 'CLOSED'
+        elif status=='OPEN':
+            cls='open'; label='OPEN'
+        else:
+            cls='waiting'; label=status.replace('_',' ')
+        return '<span class="badge ' + cls + '">' + label + '</span>'
+    row_html=[]
+    for t in trades:
+        row_html.append(
+            '<tr><td>#' + str(t['id']) + '</td><td class="sym">' + t['symbol'] + '</td>'
+            + '<td><span class="dir ' + ('long' if t['direction']=='LONG' else 'short') + '">' + t['direction'] + '</span></td>'
+            + '<td class="num">' + str(t['score']) + '</td><td>' + _status_badge(t['status'],t.get('final_result')) + '</td>'
+            + '<td class="num">' + str(t['highest_tp'] or 0) + '</td></tr>'
+        )
+    rows=''.join(row_html)
+    def _decision_badge(d):
+        cls='pass' if d in ('APPROVED',) else ('fail' if d=='NO_TRADE' else 'neutral')
+        return '<span class="badge ' + cls + '">' + str(d) + '</span>'
+    scan_html=[]
+    for x in scans:
+        scan_html.append(
+            '<tr><td class="dim">' + (x['time'][11:16] if x['time'] else '') + '</td><td class="sym">' + x['symbol'] + '</td>'
+            + '<td class="num">' + str(x['score']) + '</td><td>' + _decision_badge(x['decision']) + '</td>'
+            + '<td>' + ('✓' if x['gemini_called'] else '') + '</td><td class="dim">' + (x['reason'] or '—') + '</td></tr>'
+        )
+    scanrows=''.join(scan_html)
     bt=factor_backtest_report()
     if bt.get('note'):
-        btrows=f'<tr><td colspan="5">{bt["note"]}</td></tr>'
+        btrows='<tr><td colspan="5" class="dim">' + bt['note'] + '</td></tr>'
     else:
         def _cell(g):
             if g['trades']==0: return '—'
-            r=f"{g.get('tp3_win_rate')}% ({g['trades']})"
-            if g['avg_r'] is not None: r+=f" · avg {g['avg_r']}R"
+            r=str(g.get('tp3_win_rate')) + '% (' + str(g['trades']) + ')'
+            if g['avg_r'] is not None: r+=' \u00b7 avg ' + str(g['avg_r']) + 'R'
             return r
-        btrows=''.join(
-            f'<tr><td>{k.replace("_"," ")}</td><td>{_cell(v["with_factor"])}</td><td>{_cell(v["without_factor"])}</td>'
-            f'<td>{("+" if (v.get("edge_tp3_win_rate_pts") or 0)>=0 else "")}{v.get("edge_tp3_win_rate_pts")}pt</td>'
-            f'<td>{"✅" if v["reliable_sample"] else "low sample"}</td></tr>'
-            for k,v in bt['factors'].items()
-        )
-    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>body{{font-family:Arial;background:#080b0f;color:#d7e0ea;margin:0;padding:24px}}h1{{color:#fff}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:#11161d;border:1px solid #252d36;border-radius:12px;padding:16px}}.n{{font-size:25px;color:#fff;font-weight:700}}table{{width:100%;border-collapse:collapse;margin-top:12px;background:#0e1319}}th,td{{padding:9px;border-bottom:1px solid #202730;text-align:left;font-size:12px}}td:last-child{{color:#9aa7b5;max-width:340px}}button{{padding:10px 14px;border:0;border-radius:8px;background:#ef4444;color:#fff;font-weight:700;cursor:pointer}}a{{color:#60a5fa}}section{{margin-top:28px}}</style></head><body><h1>⚡ SMC AI PRO</h1><p>Framework: <b>{FRAMEWORK}</b> · Timeframes: <b>{" → ".join(TIMEFRAMES)}</b> · Scanner: <b>{"ON" if scanner_is_active() else "OFF"}</b> · Tracker: <b>ON</b></p><div class="grid"><div class="card">Total<div class="n">{s['total']}</div></div><div class="card">Open<div class="n">{s['open']}</div></div><div class="card">Pending Limits<div class="n">{s['pending']}</div></div><div class="card">Wins<div class="n">{s['wins']}</div></div><div class="card">Losses<div class="n">{s['losses']}</div></div><div class="card">Partial<div class="n">{s['partials']}</div></div><div class="card">Win rate<div class="n">{s['win_rate']}%</div></div></div><section><button onclick="resetAll()">Reset All Trade Statistics</button> <a href="/health">Health</a> <a href="/api/trades">Trades JSON</a> <a href="/api/backtest">Backtest JSON</a> <a href="/run-now">Run Now</a></section><section><h2>Order Limits — watching for fill</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Zone Entry</th><th>Placed At</th></tr>{pendrows or '<tr><td colspan="6">No pending limit orders</td></tr>'}</table></section><section><h2>Trade Tracking</h2><table><tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th><th>Result</th></tr>{rows or '<tr><td colspan="7">No tracked trades</td></tr>'}</table></section><section><h2>Factor Backtest — closed trades only ({bt.get("total_closed_with_factors",0)} sampled)</h2><table><tr><th>Factor</th><th>Win rate WITH it</th><th>Win rate WITHOUT it</th><th>Edge</th><th>Sample</th></tr>{btrows or '<tr><td colspan="5">No data yet</td></tr>'}</table></section><section><h2>Scan Log</h2><table><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>Gemini</th><th>Reason</th></tr>{scanrows or '<tr><td colspan="6">No scans</td></tr>'}</table></section><script>async function resetAll(){{if(!confirm('Delete ALL trades and scan history?'))return;let r=await fetch('/api/reset',{{method:'POST'}});if(r.ok)location.reload();else alert('Reset failed');}}</script></body></html>'''
+        bt_html=[]
+        for k,v in bt['factors'].items():
+            edge=v.get('edge_tp3_win_rate_pts') or 0
+            bt_html.append(
+                '<tr><td>' + k.replace('_',' ').title() + '</td><td>' + _cell(v['with_factor']) + '</td>'
+                + '<td>' + _cell(v['without_factor']) + '</td>'
+                + '<td class="' + ('pos' if edge>=0 else 'neg') + '">' + ('+' if edge>=0 else '') + str(edge) + 'pt</td>'
+                + '<td>' + ('\u2705' if v['reliable_sample'] else 'low sample') + '</td></tr>'
+            )
+        btrows=''.join(bt_html)
+    scanner_on=scanner_is_active()
+    status_pill_cls='on' if scanner_on else 'off'
+    status_pill_label='\u25cf SCANNING' if scanner_on else '\u25cf PAUSED'
+    tf_str=' \u2192 '.join(TIMEFRAMES)
+    ex_str=', '.join(EXCHANGE_ORDER).upper()
+    css='''
+:root{--bg:#0a0d12;--panel:#12161d;--panel2:#161b23;--border:#232935;--text:#e6ecf3;--dim:#8b96a5;--accent:#6ea8fe;--green:#3ddc84;--red:#ff5c72;--amber:#ffb454;--radius:14px}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;background:radial-gradient(circle at 20% -10%,#151b26,var(--bg) 60%);color:var(--text);margin:0;padding:28px 20px 60px;line-height:1.5}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-size:26px;margin:0 0 4px;letter-spacing:.3px;display:flex;align-items:center;gap:10px}
+.sub{color:var(--dim);font-size:13px;margin:0 0 24px}
+.sub b{color:var(--text);font-weight:600}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:600;border:1px solid var(--border)}
+.pill.on{color:var(--green);border-color:#1f4d38;background:#0f2018}
+.pill.off{color:var(--red);border-color:#4d1f26;background:#20100f}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:28px}
+.card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;box-shadow:0 1px 0 rgba(255,255,255,.02) inset}
+.card .label{color:var(--dim);font-size:12px;font-weight:500;text-transform:uppercase;letter-spacing:.4px}
+.card .n{font-size:26px;color:#fff;font-weight:700;margin-top:6px}
+.card.accent .n{color:var(--accent)}
+.card.good .n{color:var(--green)}
+.card.bad .n{color:var(--red)}
+section{margin-top:30px}
+section h2{font-size:15px;font-weight:600;margin:0 0 12px;display:flex;align-items:center;gap:8px;color:#fff}
+section h2 .cnt{color:var(--dim);font-weight:400;font-size:12px}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--dim);padding:10px 14px;border-bottom:1px solid var(--border);background:#0e1218}
+td{padding:10px 14px;border-bottom:1px solid #1a1f28;font-size:13px}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#151a22}
+td.sym{font-weight:600;color:#fff}
+td.num{font-variant-numeric:tabular-nums;color:var(--dim)}
+td.dim{color:var(--dim);font-size:12px;max-width:360px}
+.dir{font-weight:700;font-size:11px;padding:2px 8px;border-radius:6px}
+.dir.long{color:var(--green);background:#0f2018}
+.dir.short{color:var(--red);background:#20100f}
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:600}
+.badge.win{color:var(--green);background:#0f2018}
+.badge.loss{color:var(--red);background:#20100f}
+.badge.partial{color:var(--amber);background:#241a0c}
+.badge.open{color:var(--accent);background:#0e1a2e}
+.badge.waiting{color:var(--dim);background:#171c24}
+.badge.pass{color:var(--green);background:#0f2018}
+.badge.fail{color:var(--dim);background:#171c24}
+.badge.neutral{color:var(--amber);background:#241a0c}
+.pos{color:var(--green)}.neg{color:var(--red)}
+.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:22px}
+.actions a{color:var(--accent);text-decoration:none;font-size:13px;padding:8px 12px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}
+.actions a:hover{border-color:var(--accent)}
+button{padding:9px 16px;border:0;border-radius:9px;background:var(--red);color:#fff;font-weight:600;font-size:13px;cursor:pointer}
+button:hover{filter:brightness(1.1)}
+.empty{color:var(--dim);text-align:center;padding:22px !important}
+'''
+    body=(
+        '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta http-equiv="refresh" content="60"><title>SMC AI PRO</title><style>' + css + '</style></head>'
+        '<body><div class="wrap">'
+        '<h1>\u26a1 SMC AI PRO <span class="pill ' + status_pill_cls + '">' + status_pill_label + '</span></h1>'
+        '<p class="sub">Framework <b>' + FRAMEWORK + '</b> \u00b7 Timeframes <b>' + tf_str + '</b> \u00b7 '
+        'Strategies <b>SMC + ICT + Wyckoff</b> (2/3 vote) \u00b7 Exchange <b>' + ex_str + '</b></p>'
+        '<div class="grid">'
+        '<div class="card"><div class="label">Total Trades</div><div class="n">' + str(s['total']) + '</div></div>'
+        '<div class="card accent"><div class="label">Open</div><div class="n">' + str(s['open']) + '</div></div>'
+        '<div class="card good"><div class="label">Wins</div><div class="n">' + str(s['wins']) + '</div></div>'
+        '<div class="card bad"><div class="label">Losses</div><div class="n">' + str(s['losses']) + '</div></div>'
+        '<div class="card"><div class="label">Partial</div><div class="n">' + str(s['partials']) + '</div></div>'
+        '<div class="card accent"><div class="label">Win Rate</div><div class="n">' + str(s['win_rate']) + '%</div></div>'
+        '</div>'
+        '<div class="actions">'
+        '<button onclick="resetAll()">Reset All Statistics</button>'
+        '<a href="/health">Health</a><a href="/api/trades">Trades JSON</a><a href="/api/backtest">Backtest JSON</a><a href="/run-now">Run Now</a>'
+        '</div>'
+        '<section><h2>\U0001F4C8 Trade Tracking <span class="cnt">last 50</span></h2><div class="panel"><table>'
+        '<tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Status</th><th>Highest TP</th></tr>'
+        + (rows or '<tr><td colspan="6" class="empty">No tracked trades yet</td></tr>') + '</table></div></section>'
+        '<section><h2>\U0001F9EA Factor Backtest <span class="cnt">' + str(bt.get('total_closed_with_factors',0)) + ' closed trades sampled</span></h2>'
+        '<div class="panel"><table><tr><th>Factor</th><th>Win Rate WITH</th><th>Win Rate WITHOUT</th><th>Edge</th><th>Sample</th></tr>'
+        + (btrows or '<tr><td colspan="5" class="empty">No data yet</td></tr>') + '</table></div></section>'
+        '<section><h2>\U0001F50D Scan Log <span class="cnt">last 30</span></h2><div class="panel"><table>'
+        '<tr><th>Time</th><th>Symbol</th><th>Score</th><th>Decision</th><th>AI</th><th>Reason</th></tr>'
+        + (scanrows or '<tr><td colspan="6" class="empty">No scans yet</td></tr>') + '</table></div></section>'
+        '</div>'
+        '<script>async function resetAll(){if(!confirm(\'Delete ALL trades and scan history?\'))return;'
+        'let r=await fetch(\'/api/reset\',{method:\'POST\'});if(r.ok)location.reload();else alert(\'Reset failed\');}</script>'
+        '</body></html>'
+    )
+    return body
 
-
-
-# ===================== FINAL STRATEGY AUDIT PATCH v2 =====================
-# This replaces the earlier audit patch with one coherent execution/evaluation
-# path.  Key goals:
-#   1) hard filters -> watch state -> trigger -> rank -> Gemini
-#   2) no unvalidated limit orders by default
-#   3) Gemini is genuinely independent of quant score/reasons
-#   4) structure agreement counts positive agreement, not False/False
-#   5) BOS/CHOCH/sweep use confirmed swings
-#   6) OB/FVG require displacement + freshness
-#   7) CRT/TBS are one confirmation group, max +4
-#   8) targets are structural liquidity first, not "number of reasons"
-#   9) top N candidates can reach Gemini instead of only #1
-#  10) statistics report TP1/TP2/positive-rate/expectancy and separate paths
-#  11) factor report is explicitly forward/observational; it cannot silently
-#      become a weight optimizer from tiny samples.
-
-ENABLE_PENDING_LIMITS = os.getenv('ENABLE_PENDING_LIMITS', '0').strip().lower() in ('1','true','yes','on')
 MAX_GEMINI_CANDIDATES = max(1, int(os.getenv('MAX_GEMINI_CANDIDATES', '3')))
 MAX_CONCURRENT_TRADES = max(1, int(os.getenv('MAX_CONCURRENT_TRADES', '3')))
 
@@ -2106,8 +2203,8 @@ HTF_BIAS_MIN_STRENGTH = max(0.0, min(1.0, float(os.getenv('HTF_BIAS_MIN_STRENGTH
 # tagged higher-confidence). <=1/3 -> NO_TRADE. No separate blocking hard
 # filter anymore -- HTF bias/trend are now internal SMC/Trend components.
 SMC_MIN_SCORE = float(os.getenv('SMC_MIN_SCORE', '55'))
-TREND_MIN_SCORE = float(os.getenv('TREND_MIN_SCORE', '55'))
-MEANREV_MIN_SCORE = float(os.getenv('MEANREV_MIN_SCORE', '55'))
+ICT_MIN_SCORE = float(os.getenv('ICT_MIN_SCORE', '55'))
+WYCKOFF_MIN_SCORE = float(os.getenv('WYCKOFF_MIN_SCORE', '55'))
 FACTOR_MIN_SAMPLE = max(10, int(os.getenv('FACTOR_MIN_SAMPLE', '20')))
 INTRABAR_POLICY = os.getenv('INTRABAR_POLICY', 'conservative').strip().lower()
 if INTRABAR_POLICY not in ('conservative', 'optimistic', 'unknown'):
@@ -2370,16 +2467,16 @@ def build_analysis(symbol):
     strat_extra={'LONG':{},'SHORT':{}}
     for d in ('LONG','SHORT'):
         s_smc,r_smc,f_smc,x_smc=_score_smc(a1,a2,a3,c1,c2,c3,d)
-        s_trend,r_trend,f_trend,x_trend=_score_trend(a1,a2,a3,c1,c2,c3,d)
-        s_mr,r_mr,f_mr,x_mr=_score_meanrev(a1,a2,a3,c1,c2,c3,d)
-        strat_scores[d]={'smc':s_smc,'trend':s_trend,'meanrev':s_mr}
-        strat_reasons[d]={'smc':r_smc,'trend':r_trend,'meanrev':r_mr}
-        strat_flags[d]={'smc':f_smc,'trend':f_trend,'meanrev':f_mr}
-        strat_extra[d]={'smc':x_smc,'trend':x_trend,'meanrev':x_mr}
-        log.info('[VOTE] %s dir=%s SMC=%.1f(%s) Trend=%.1f(%s) MeanRev=%.1f(%s)',
+        s_ict,r_ict,f_ict,x_ict=_score_ict(a1,a2,a3,c1,c2,c3,d)
+        s_wy,r_wy,f_wy,x_wy=_score_wyckoff(a1,a2,a3,c1,c2,c3,d)
+        strat_scores[d]={'smc':s_smc,'ict':s_ict,'wyckoff':s_wy}
+        strat_reasons[d]={'smc':r_smc,'ict':r_ict,'wyckoff':r_wy}
+        strat_flags[d]={'smc':f_smc,'ict':f_ict,'wyckoff':f_wy}
+        strat_extra[d]={'smc':x_smc,'ict':x_ict,'wyckoff':x_wy}
+        log.info('[VOTE] %s dir=%s SMC=%.1f(%s) ICT=%.1f(%s) Wyckoff=%.1f(%s)',
                   symbol,d,s_smc,'PASS' if s_smc>=SMC_MIN_SCORE else 'fail',
-                  s_trend,'PASS' if s_trend>=TREND_MIN_SCORE else 'fail',
-                  s_mr,'PASS' if s_mr>=MEANREV_MIN_SCORE else 'fail')
+                  s_ict,'PASS' if s_ict>=ICT_MIN_SCORE else 'fail',
+                  s_wy,'PASS' if s_wy>=WYCKOFF_MIN_SCORE else 'fail')
 
     # Voting: count passes per direction, pick the direction with a valid
     # vote (>=2/3). If both directions somehow qualify, take the stronger
@@ -2387,9 +2484,19 @@ def build_analysis(symbol):
     vote_info={}
     for d in ('LONG','SHORT'):
         passes=[strat_scores[d]['smc']>=SMC_MIN_SCORE,
-                strat_scores[d]['trend']>=TREND_MIN_SCORE,
-                strat_scores[d]['meanrev']>=MEANREV_MIN_SCORE]
-        vote_info[d]={'count':sum(passes),'combined':sum(strat_scores[d].values())}
+                strat_scores[d]['ict']>=ICT_MIN_SCORE,
+                strat_scores[d]['wyckoff']>=WYCKOFF_MIN_SCORE]
+        passing_scores=[s for s,p in zip(strat_scores[d].values(),passes) if p]
+        # `combined` drives which direction wins on a 2-vs-2-direction tie
+        # (rare) -- keep as sum of ALL 3 for that. `passing_avg` is what
+        # actually gets shown/logged as "quant score": the average of ONLY
+        # the strategies that passed their own threshold, since those are
+        # what justified the trade. Averaging in a failed strategy's low
+        # score (as before) could show a displayed score BELOW every
+        # strategy's own MIN_SCORE despite 2/3 or 3/3 having passed --
+        # confusing and not representative of why the trade fired.
+        vote_info[d]={'count':sum(passes),'combined':sum(strat_scores[d].values()),
+                      'passing_avg':sum(passing_scores)/len(passing_scores) if passing_scores else 0.0}
 
     candidates=[d for d in ('LONG','SHORT') if vote_info[d]['count']>=2]
     if not candidates:
@@ -2403,11 +2510,10 @@ def build_analysis(symbol):
         direction=None  # never silently pick on a near-tie between two qualifying directions
 
     vote_count=vote_info[direction]['count'] if direction else 0
-    # Composite 0-100 "best_score" for downstream MIN_SCORE/logging/
-    # dashboard compatibility: average of the 3 strategy scores, with a
-    # 3/3-unanimous bonus (higher confidence) capped at 100.
+    # "quant score" shown everywhere downstream: average of the PASSING
+    # strategies only (see note above), with a 3/3-unanimous bonus.
     if direction:
-        avg_score=vote_info[direction]['combined']/3.0
+        avg_score=vote_info[direction]['passing_avg']
         best_score=min(100.0,avg_score*1.10) if vote_count==3 else avg_score
     else:
         best_score=0.0
@@ -2425,8 +2531,8 @@ def build_analysis(symbol):
         flags={}
         htf_strength=0.0
     else:
-        reasons_best=(strat_reasons[direction]['smc']+strat_reasons[direction]['trend']
-                      +strat_reasons[direction]['meanrev'])
+        reasons_best=(strat_reasons[direction]['smc']+strat_reasons[direction]['ict']
+                      +strat_reasons[direction]['wyckoff'])
         reasons_best=[f'[{vote_count}/3 strategies] '+', '.join(reasons_best[:3])+f' (+{max(0,len(reasons_best)-3)} more)'] if reasons_best else []
         flags=strat_flags[direction]['smc']  # SMC's own bos/choch/order_block/fvg/crt/tbs -- what structure_agreement compares Gemini against
         htf_strength=strat_extra[direction]['smc'].get('htf_strength',0.0)
@@ -2482,10 +2588,19 @@ def build_analysis(symbol):
 
 # ---------------- Independent Gemini validation ----------------
 def gemini_validate(analysis):
-    # Deliberately DO NOT send quant score/reasons/levels. This removes the
-    # strongest anchoring source and makes the second model a real second read.
+    """Independent SETUP-QUALITY validator. Per design: AI should not
+    generate SL/TP arbitrarily -- those come from quant's structure/
+    volatility calculation (already computed in `analysis`). Gemini's
+    job is filtering/scoring setup quality only: does the evidence on
+    the raw candles actually support this direction, structurally.
+    Deliberately DO NOT send quant score/reasons/levels -- this removes
+    the strongest anchoring source and makes the second model a real
+    second read."""
     prompt={
-        'task':'Independently analyze the raw OHLCV and return a trade decision. Do not infer missing structure.',
+        'task':('Independently judge SETUP QUALITY from the raw OHLCV only. Do NOT '
+                'propose an entry, stop loss, or take profit -- those are computed '
+                'separately from market structure/volatility. Your job is to confirm '
+                'or reject whether the evidence supports a real, high-quality setup.'),
         'symbol':analysis['symbol'],
         'framework':analysis['framework'],
         'timeframes':analysis['timeframes'],
@@ -2501,114 +2616,71 @@ def gemini_validate(analysis):
     }
     system="""You are an independent second analyst for a crypto trading research bot.
 Use ONLY the supplied raw OHLCV candles and derived neutral market data.
-Do NOT receive or use a quant score, quant direction, quant Entry/SL/TP, or quant reasons.
-Check directly: HTF structural bias, trend, liquidity sweep, BOS, CHOCH/MSS,
-15M order block/FVG, volume/momentum, CRT/TBS, and candle pattern.
-Approve ONLY when the setup has a clear directional thesis, a real confirmed
-structure event, a sensible entry, an invalidation stop, and TP1/TP2/TP3 with
-TP2 at least 2R. If evidence is incomplete, REJECT.
+Do NOT receive or use a quant score, quant direction, or quant Entry/SL/TP.
+Do NOT propose your own entry, stop loss, or take profit -- that is explicitly not
+your job here. Check directly: HTF structural bias, trend, liquidity sweep, BOS,
+CHOCH/MSS, 15M order block/FVG, volume/momentum, CRT/TBS, and candle pattern.
+PASS ("APPROVE") only when the setup has a clear directional thesis and real
+confirmed structure evidence. If evidence is incomplete or contradictory, FAIL
+("REJECT").
 Return ONLY JSON:
 {
  "decision":"APPROVE|REJECT",
  "direction":"LONG|SHORT",
- "score":0-100,
  "confidence":0-100,
- "entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,
  "bos_detected":true/false,"choch_detected":true/false,
  "order_block_detected":true/false,"fvg_detected":true/false,
  "crt_detected":true/false,"tbs_detected":true/false,
+ "reason_codes":["short evidence tags, e.g. clean_bos","htf_bias_aligned","weak_volume"],
+ "pattern_summary":"short candle-pattern label seen at entry, e.g. bearish engulfing (or 'none')",
+ "location_summary":"short label for where entry sits, e.g. 15M OB retest",
+ "meaning_summary":"one short phrase on what this setup means structurally",
  "reason":"brief evidence-based reason"
 }"""
-    return gemini_json(system,prompt,max_output_tokens=1800)
+    return gemini_json(system,prompt,max_output_tokens=1200)
 
 def _resolve_trade_levels(best, ai):
     """Once a candidate has passed the >=2/3 strategy vote, a trade WILL
-    happen -- Gemini is a second opinion for CALIBRATING SL/TP, not a
-    gatekeeper with veto power. This always returns a usable trade_plan,
-    falling back to quant's own independently-computed entry/sl/tp1-3
-    whenever Gemini's input can't be trusted or used for any reason
-    (REJECT, direction mismatch, weak structure agreement, missing/
-    invalid levels, or the numbers simply disagreeing with quant's own).
-    Returns (trade_plan, note, gemini_score).
+    happen. SL/TP are NEVER generated by Gemini -- they always come from
+    quant's own structure/volatility-based computation (already in
+    `best`, from build_analysis). Gemini's role is setup-quality
+    filtering/context only: its PASS/FAIL, confidence, and structure
+    agreement are surfaced for the trade card and logs, but never change
+    the trade's actual levels and never veto the trade (voting already
+    decided that). Returns (trade_plan, note, gemini_score).
     """
     try:
         gemini_score=float(ai.get('score',ai.get('confidence',0)) or 0)
     except (TypeError,ValueError):
         gemini_score=0.0
 
-    def _quant_fallback(note):
-        plan=dict(best)
-        plan.update({'rr':abs(best['tp2']-best['entry'])/max(abs(best['entry']-best['sl']),1e-12)})
-        return plan, note, gemini_score
-
-    if str(ai.get('decision','REJECT')).upper()!='APPROVE' or gemini_score<GEMINI_MIN_SCORE:
-        why=ai.get('reason') or (
-            'Gemini response was truncated before a reason could be captured'
-            if ai.get('_truncated_reject') else 'Gemini rejected (no reason given)'
-        )
-        return _quant_fallback(f"Gemini did not approve ({why}) -- trade proceeds on quant's own levels (vote already passed)")
-
-    g_direction=str(ai.get('direction') or '').upper()
-    if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
-        return _quant_fallback("Gemini direction disagreed with quant -- trade proceeds on quant's own direction/levels")
-
-    positive,checked,agreement=structure_agreement(best.get('factor_flags',{}),ai)
-    if checked>=3 and (positive<MIN_STRUCTURE_AGREEMENTS or agreement<MAX_STRUCTURE_DISAGREEMENT):
-        return _quant_fallback(f"Weak structure agreement with Gemini ({positive}/{checked}, ratio={agreement:.2f}) "
-                                "-- trade proceeds on quant's own levels")
-
-    try:
-        vals=[float(ai[k]) for k in ('entry','sl','tp1','tp2','tp3')]
-        g_entry,g_sl,g_tp1,g_tp2,g_tp3=vals
-    except (KeyError,TypeError,ValueError):
-        return _quant_fallback("Gemini approval missing valid trade levels -- trade proceeds on quant's own levels")
-
-    ok,why=_final_level_check(g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3)
-    if not ok:
-        return _quant_fallback(f"Gemini's own levels failed sanity check ({why}) -- trade proceeds on quant's own levels")
-
-    # Gemini's proposal is internally valid -- now reconcile against
-    # quant's OWN independently-computed levels (this is the actual
-    # "figure out which SL/TP is correct" step, not a veto).
-    atrv=best.get('structure_levels',{}).get('atr_5m') or abs(g_entry)*0.005
-    q_sl=best.get('sl'); q_tp1=best.get('tp1'); q_tp2=best.get('tp2'); q_tp3=best.get('tp3')
-    if q_sl is not None:
-        gap_atr=abs(g_sl-q_sl)/max(atrv,1e-9)
-        if gap_atr<=SL_STRUCTURE_TOLERANCE_ATR:
-            final_sl=(g_sl+q_sl)/2
-            final_tp1=(g_tp1+q_tp1)/2 if q_tp1 is not None else g_tp1
-            final_tp2=(g_tp2+q_tp2)/2 if q_tp2 is not None else g_tp2
-            final_tp3=(g_tp3+q_tp3)/2 if q_tp3 is not None else g_tp3
-            note=f'Quant/Gemini SL converge ({gap_atr:.2f} ATR apart) -- using averaged levels'
-        else:
-            final_sl,final_tp1,final_tp2,final_tp3=q_sl,q_tp1,q_tp2,q_tp3
-            note=(f'Quant/Gemini SL disagree ({gap_atr:.2f} ATR apart, tolerance {SL_STRUCTURE_TOLERANCE_ATR}) '
-                  "-- using quant's own levels")
-    else:
-        sl_ok,sl_why,nearest_ref=_verify_sl_against_structure(g_direction,g_sl,best.get('structure_levels',{}))
-        if sl_ok:
-            final_sl,final_tp1,final_tp2,final_tp3=g_sl,g_tp1,g_tp2,g_tp3
-            note=sl_why
-        elif nearest_ref is not None:
-            final_sl,final_tp1,final_tp2,final_tp3=_correct_sl_to_structure(
-                g_direction,g_entry,g_sl,g_tp1,g_tp2,g_tp3,nearest_ref,atrv
-            )
-            note=f'SL auto-corrected to structure ({sl_why})'
-        else:
-            return _quant_fallback(f"Gemini SL failed structure check with no reference to correct to ({sl_why}) "
-                                    "-- trade proceeds on quant's own levels")
-
-    ok2,why2=_final_level_check(g_direction,g_entry,final_sl,final_tp1,final_tp2,final_tp3)
-    if not ok2:
-        return _quant_fallback(f"Reconciled levels failed sanity check ({why2}) -- trade proceeds on quant's own levels")
-
     trade_plan=dict(best)
-    trade_plan.update({
-        'direction':g_direction,'entry':g_entry,'sl':final_sl,
-        'tp1':final_tp1,'tp2':final_tp2,'tp3':final_tp3,
-        'rr':abs(final_tp2-g_entry)/max(abs(g_entry-final_sl),1e-12)
-    })
-    return trade_plan, ai.get('reason','')+f' | {note}', gemini_score
+    trade_plan.update({'rr':abs(best['tp2']-best['entry'])/max(abs(best['entry']-best['sl']),1e-12)})
+
+    gemini_decision=str(ai.get('decision','REJECT')).upper()
+    if gemini_decision=='APPROVE' and gemini_score>=GEMINI_MIN_SCORE:
+        g_direction=str(ai.get('direction') or '').upper()
+        if g_direction not in ('LONG','SHORT') or g_direction!=best['direction']:
+            note="Gemini direction disagreed with quant -- levels unaffected (quant direction/levels used, as always)"
+        else:
+            positive,checked,agreement=structure_agreement(best.get('factor_flags',{}),ai)
+            if checked>=3 and (positive<MIN_STRUCTURE_AGREEMENTS or agreement<MAX_STRUCTURE_DISAGREEMENT):
+                note=f"Gemini approved but weak structure agreement ({positive}/{checked}, ratio={agreement:.2f})"
+            else:
+                note=f"Gemini confirms setup quality (structure agreement {positive}/{checked})"
+    else:
+        why=ai.get('reason') or (
+            'response truncated before a reason could be captured'
+            if ai.get('_truncated_reject') else 'no reason given'
+        )
+        note=f"Gemini did not confirm ({why}) -- trade proceeds on quant's own vote/levels regardless"
+
+    gemini_reason=ai.get('reason','').strip()
+    full_note=f'[Gemini: {gemini_reason}] {note}' if gemini_reason else note
+    return trade_plan, full_note, gemini_score
+
+
+
 def _adx(candles, n=14):
     """Wilder's ADX -- direction-agnostic trend-STRENGTH (0-100). Used by
     the Trend-Following strategy's 1H component."""
@@ -2758,147 +2830,125 @@ def _score_smc(a1,a2,a3,c1,c2,c3,d):
 
 
 # ==================== Strategy 2: Trend Following + Momentum ====================
-def _score_trend(a1,a2,a3,c1,c2,c3,d):
-    """1H EMA50/200 trend+HH/HL/LH/LL+ADX+major S/R, 15M continuation+
-    pullback+momentum, 5M breakout/retest+momentum candle+volume.
-    Weights sum to 100: ema_trend 20, swing_structure 15, adx 15,
-    sr_context 10, continuation_15m 10, pullback_15m 10, breakout_5m 10,
-    momentum_candle_5m 10."""
-    e200=a1.get('ema200')
-    ema_trend_ok=(e200 is not None and ((d=='LONG' and a1['price']>a1['ema50']>e200) or
-                                          (d=='SHORT' and a1['price']<a1['ema50']<e200)))
-    ema_dist=min(1.0,abs(a1['price']-a1['ema50'])/max(a1['atr'],1e-9)/1.0) if ema_trend_ok else 0.0
-    ema_trend_strength=1.0 if ema_trend_ok else 0.0
-    ema_trend_strength=max(ema_trend_strength,ema_dist*0.5) if ema_trend_ok else 0.0
-    ema_trend_strength=1.0 if ema_trend_ok else 0.0  # binary structural gate, kept simple/explicit
-
-    highs=a1.get('swing_highs') or []; lows=a1.get('swing_lows') or []
-    swing_strength=(_swing_structure_strength(highs,d,True) if d=='LONG'
-                     else _swing_structure_strength(highs,d,False))*0.5 + \
-                    (_swing_structure_strength(lows,d,True) if d=='LONG'
-                     else _swing_structure_strength(lows,d,False))*0.5
-
-    adx=_adx(c1)
-    adx_strength=min(1.0,adx/25.0)
-
-    atrv1=max(a1['atr'],1e-9)
-    opposing=lows if d=='LONG' else highs  # for LONG, opposing wall is a swing LOW below? actually resistance for LONG is a swing HIGH above
-    opposing=highs if d=='LONG' else lows
-    if opposing:
-        dist=abs(opposing[-1][1]-a1['price'])/atrv1
-        sr_strength=min(1.0,dist/2.0)  # far from opposing S/R = more room = stronger
-    else:
-        sr_strength=0.5
-
-    trend15_ok=((d=='LONG' and a2['ema20']>a2['ema50']) or (d=='SHORT' and a2['ema20']<a2['ema50']))
-    continuation_strength=1.0 if trend15_ok else 0.0
+def _score_ict(a1,a2,a3,c1,c2,c3,d):
+    """ICT (Inner Circle Trader) concepts -- 1H liquidity direction, 15M
+    liquidity sweep + displacement + FVG, 5M killzone timing + OTE
+    retracement entry. Weights sum to 100: liquidity_1h 20, sweep_15m 20,
+    displacement_15m 20, fvg_15m 15, killzone_5m 10, ote_5m 15."""
+    liq_dir_ok=(a1['ema20']>a1['ema50']) if d=='LONG' else (a1['ema20']<a1['ema50'])
+    liq_strength=min(1.0,abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-9)) if liq_dir_ok else 0.0
 
     atrv2=max(a2['atr'],1e-9)
-    pullback_dist=min(abs(a2['price']-a2['ema20']),abs(a2['price']-a2['ema50']))/atrv2
-    pullback_strength=max(0.0,1.0-min(1.0,pullback_dist/1.5))
-
-    atrv3=max(a3['atr'],1e-9)
-    recent_high=max(x['high'] for x in c3[-15:-3]) if len(c3)>=15 else a3['high']
-    recent_low=min(x['low'] for x in c3[-15:-3]) if len(c3)>=15 else a3['low']
-    if d=='LONG':
-        broke_out=any(x['close']>recent_high for x in c3[-3:])
-        retested=a3['price']>=recent_high-0.3*atrv3
-        breakout_strength=1.0 if (broke_out and retested) else (0.5 if broke_out else 0.0)
-    else:
-        broke_out=any(x['close']<recent_low for x in c3[-3:])
-        retested=a3['price']<=recent_low+0.3*atrv3
-        breakout_strength=1.0 if (broke_out and retested) else (0.5 if broke_out else 0.0)
-
-    body=abs(c3[-1]['close']-c3[-1]['open']); rng=max(c3[-1]['high']-c3[-1]['low'],1e-9)
-    candle_dir_ok=(c3[-1]['close']>c3[-1]['open']) if d=='LONG' else (c3[-1]['close']<c3[-1]['open'])
-    momentum_candle_strength=(body/rng if candle_dir_ok else 0.0)
-    vol_strength=min(1.0,max(0.0,a3['volume_ratio']-1.0))
-    momentum5_strength=0.5*momentum_candle_strength+0.5*vol_strength
-
-    score=(20*ema_trend_strength+15*swing_strength+15*adx_strength+10*sr_strength
-           +10*continuation_strength+10*pullback_strength+10*breakout_strength+10*momentum5_strength)
-    reasons=[]
-    if ema_trend_strength>0: reasons.append('1H EMA50/200 trend aligned')
-    if swing_strength>0: reasons.append(f'1H swing structure {swing_strength:.0%}')
-    if adx_strength>0: reasons.append(f'ADX {adx:.0f}')
-    if sr_strength>0: reasons.append(f'S/R room {sr_strength:.0%}')
-    if continuation_strength>0: reasons.append('15M trend continuation')
-    if pullback_strength>0: reasons.append(f'15M pullback {pullback_strength:.0%}')
-    if breakout_strength>0: reasons.append(f'5M breakout/retest {breakout_strength:.0%}')
-    if momentum5_strength>0: reasons.append(f'5M momentum candle {momentum5_strength:.0%}')
-    flags={'ema_trend':ema_trend_strength>0,'swing_structure':swing_strength>0,'adx':adx_strength>0,
-           'sr_context':sr_strength>0,'continuation':continuation_strength>0,'pullback':pullback_strength>0,
-           'breakout_retest':breakout_strength>0,'momentum_candle':momentum5_strength>0}
-    return min(100.0,score),reasons,flags,{'adx':adx}
-
-
-# ==================== Strategy 3: Mean Reversion + Liquidity Reversal ====================
-def _score_meanrev(a1,a2,a3,c1,c2,c3,d):
-    """1H ranging/extended+major HTF levels, 15M price extreme+VWAP/
-    Bollinger deviation+RSI extreme, 5M liquidity sweep+rejection+
-    structure reversal+confirmation candle. Weights sum to 100:
-    ranging_1h 20, htf_level_1h 15, price_extreme_15m 15,
-    bollinger_15m 15, rsi_extreme_15m 10, sweep_5m 15, reversal_5m 10."""
-    trend_ratio=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
-    ranging_strength=max(0.0,1.0-min(1.0,trend_ratio))  # low 1h trend strength = ranging = favorable
-
-    atrv1=max(a1['atr'],1e-9)
-    levels=(a1.get('swing_lows') or []) if d=='LONG' else (a1.get('swing_highs') or [])
-    if levels:
-        dist=abs(levels[-1][1]-a1['price'])/atrv1
-        htf_level_strength=max(0.0,1.0-min(1.0,dist/1.0))
-    else:
-        htf_level_strength=0.0
-
-    rng15=max(a2['range'],1e-9)
-    if d=='LONG':
-        extreme_strength=max(0.0,1.0-min(1.0,(a2['price']-a2['low'])/rng15/0.25))
-    else:
-        extreme_strength=max(0.0,1.0-min(1.0,(a2['high']-a2['price'])/rng15/0.25))
-
-    lo,mid,hi=_bollinger(c2)
-    band_half=max((hi-lo)/2,1e-9)
-    if d=='LONG':
-        boll_strength=max(0.0,min(1.0,(lo-a2['price'])/band_half+1.0)) if a2['price']<=lo+band_half*0.3 else 0.0
-    else:
-        boll_strength=max(0.0,min(1.0,(a2['price']-hi)/band_half+1.0)) if a2['price']>=hi-band_half*0.3 else 0.0
-
-    rsi15=a2['rsi']
-    if d=='LONG':
-        rsi_strength=max(0.0,min(1.0,(35-rsi15)/15.0)) if rsi15<35 else 0.0
-    else:
-        rsi_strength=max(0.0,min(1.0,(rsi15-65)/15.0)) if rsi15>65 else 0.0
-
-    sweep=a3['bull_sweep'] if d=='LONG' else a3['bear_sweep']
-    sweep_level=a3['bull_sweep_level'] if d=='LONG' else a3['bear_sweep_level']
-    atrv3=max(a3['atr'],1e-9)
-    if sweep and sweep_level is not None:
-        depth=((sweep_level-min(x['low'] for x in c3[-3:])) if d=='LONG'
-               else (max(x['high'] for x in c3[-3:])-sweep_level))/atrv3
+    sweep15=a2['bull_sweep'] if d=='LONG' else a2['bear_sweep']
+    sweep15_level=a2['bull_sweep_level'] if d=='LONG' else a2['bear_sweep_level']
+    if sweep15 and sweep15_level is not None:
+        depth=((sweep15_level-min(x['low'] for x in c2[-3:])) if d=='LONG'
+               else (max(x['high'] for x in c2[-3:])-sweep15_level))/atrv2
         sweep_strength=min(1.0,max(0.0,depth)/0.5)
     else:
         sweep_strength=0.0
+
+    # Displacement: a strong impulsive candle (big body relative to ATR)
+    # in the trade direction within the last few 15M candles.
+    disp_strength=0.0
+    for cc in c2[-3:]:
+        body=abs(cc['close']-cc['open'])
+        dir_ok=(cc['close']>cc['open']) if d=='LONG' else (cc['close']<cc['open'])
+        if dir_ok:
+            disp_strength=max(disp_strength,min(1.0,body/(1.5*atrv2)))
+
+    fvg=detect_fvg(c2,d)
+    in_fvg=bool(fvg and fvg['low']<=a3['price']<=fvg['high'])
+    fvg_strength=0.6*float(bool(fvg))+0.4*float(in_fvg)
+
+    # Killzone: London (07-10 UTC) / New York (13-16 UTC) sessions --
+    # ICT's high-liquidity windows where institutional moves concentrate.
+    hour=datetime.now(timezone.utc).hour
+    in_killzone=(7<=hour<10) or (13<=hour<16)
+    killzone_strength=1.0 if in_killzone else 0.3
+
+    # OTE (Optimal Trade Entry): price sitting in the 62-79% retracement
+    # zone of the recent 15M range, in the trade's favor.
+    rng2=max(a2['range'],1e-9)
+    if d=='LONG':
+        ote_lo=a2['low']+0.62*rng2; ote_hi=a2['low']+0.79*rng2
+    else:
+        ote_hi=a2['high']-0.62*rng2; ote_lo=a2['high']-0.79*rng2
+    ote_strength=1.0 if min(ote_lo,ote_hi)<=a3['price']<=max(ote_lo,ote_hi) else 0.0
+
+    score=(20*liq_strength+20*sweep_strength+20*disp_strength+15*fvg_strength
+           +10*killzone_strength+15*ote_strength)
+    reasons=[]
+    if liq_strength>0: reasons.append(f'1H liquidity direction {liq_strength:.0%}')
+    if sweep_strength>0: reasons.append(f'15M liquidity sweep {sweep_strength:.0%}')
+    if disp_strength>0: reasons.append(f'15M displacement {disp_strength:.0%}')
+    if fvg_strength>0: reasons.append(f'15M FVG {fvg_strength:.0%}')
+    if in_killzone: reasons.append('in London/NY killzone')
+    if ote_strength>0: reasons.append('price in OTE zone')
+    flags={'liquidity_direction':liq_strength>0,'liquidity_sweep':bool(sweep15),'displacement':disp_strength>0,
+           'fvg':bool(fvg),'killzone':in_killzone,'ote':ote_strength>0}
+    return min(100.0,score),reasons,flags,{'in_killzone':in_killzone}
+
+
+
+
+
+# ==================== Strategy 3: Mean Reversion + Liquidity Reversal ====================
+def _score_wyckoff(a1,a2,a3,c1,c2,c3,d):
+    """Wyckoff method -- 1H accumulation/distribution range + composite
+    position, 15M spring/upthrust + effort-vs-result volume, 5M
+    confirmation candle. Weights sum to 100: range_1h 20, position_1h 15,
+    spring_upthrust_15m 25, effort_result_15m 20, confirmation_5m 20."""
+    trend_ratio=abs(a1['ema20']-a1['ema50'])/max(a1['atr'],1e-12)
+    range_strength=max(0.0,1.0-min(1.0,trend_ratio))  # ranging 1H = accumulation/distribution context
+
+    rng1=max(a1['range'],1e-9)
+    if d=='LONG':
+        position_strength=max(0.0,1.0-min(1.0,(a1['price']-a1['low'])/rng1/0.3))
+    else:
+        position_strength=max(0.0,1.0-min(1.0,(a1['high']-a1['price'])/rng1/0.3))
+
+    # Spring/upthrust: a false breakout of the recent 15M range (wicks
+    # beyond the range extreme) that closes back INSIDE it -- the classic
+    # Wyckoff spring (LONG) / upthrust (SHORT) signature.
+    atrv2=max(a2['atr'],1e-9)
+    recent15=c2[-15:-3] if len(c2)>=15 else c2[:-3] or c2
+    range_low=min(x['low'] for x in recent15) if recent15 else a2['low']
+    range_high=max(x['high'] for x in recent15) if recent15 else a2['high']
+    last2=c2[-1]
+    if d=='LONG':
+        spring=last2['low']<range_low and last2['close']>range_low
+        depth=(range_low-last2['low'])/atrv2 if spring else 0.0
+    else:
+        spring=last2['high']>range_high and last2['close']<range_high
+        depth=(last2['high']-range_high)/atrv2 if spring else 0.0
+    spring_strength=min(1.0,max(0.0,depth)/0.3) if spring else 0.0
+
+    # Effort vs result: big volume with a small price move near a range
+    # extreme signals absorption (smart money accumulating/distributing)
+    # -- a classic Wyckoff turning-point signature.
+    body=abs(last2['close']-last2['open']); rng2=max(last2['high']-last2['low'],1e-9)
+    small_move=1.0-min(1.0,body/rng2)
+    vol_strength=min(1.0,max(0.0,a2['volume_ratio']-1.0))
+    effort_result_strength=0.5*small_move+0.5*vol_strength
 
     last=c3[-1]; prev=c3[-2] if len(c3)>=2 else last
     reversed_close=(last['close']>prev['close'] and last['close']>last['open']) if d=='LONG' else \
                     (last['close']<prev['close'] and last['close']<last['open'])
     pbonus=build_pattern_score(detect_candlestick_patterns(c3),d)
-    reversal_strength=(0.6 if reversed_close else 0.0)+min(0.4,pbonus/10.0)
+    confirmation_strength=min(1.0,(0.6 if reversed_close else 0.0)+min(0.4,pbonus/10.0))
 
-    score=(20*ranging_strength+15*htf_level_strength+15*extreme_strength+15*boll_strength
-           +10*rsi_strength+15*sweep_strength+10*min(1.0,reversal_strength))
+    score=(20*range_strength+15*position_strength+25*spring_strength
+           +20*effort_result_strength+20*confirmation_strength)
     reasons=[]
-    if ranging_strength>0.3: reasons.append(f'1H ranging {ranging_strength:.0%}')
-    if htf_level_strength>0: reasons.append(f'major HTF level {htf_level_strength:.0%}')
-    if extreme_strength>0: reasons.append(f'15M price extreme {extreme_strength:.0%}')
-    if boll_strength>0: reasons.append(f'Bollinger deviation {boll_strength:.0%}')
-    if rsi_strength>0: reasons.append(f'RSI extreme ({rsi15:.0f})')
-    if sweep_strength>0: reasons.append(f'liquidity sweep {sweep_strength:.0%}')
-    if reversal_strength>0: reasons.append('rejection/reversal candle')
-    flags={'ranging':ranging_strength>0.3,'htf_level':htf_level_strength>0,'price_extreme':extreme_strength>0,
-           'bollinger':boll_strength>0,'rsi_extreme':rsi_strength>0,'liquidity_sweep':bool(sweep),
-           'reversal':reversal_strength>0}
-    return min(100.0,score),reasons,flags,{'rsi15':rsi15}
+    if range_strength>0.3: reasons.append(f'1H accumulation/distribution range {range_strength:.0%}')
+    if position_strength>0: reasons.append(f'range position {position_strength:.0%}')
+    if spring_strength>0: reasons.append(f'15M spring/upthrust {spring_strength:.0%}')
+    if effort_result_strength>0: reasons.append(f'effort-vs-result {effort_result_strength:.0%}')
+    if confirmation_strength>0: reasons.append('5M confirmation candle')
+    flags={'range':range_strength>0.3,'position':position_strength>0,'spring_upthrust':bool(spring),
+           'effort_result':effort_result_strength>0,'confirmation':confirmation_strength>0}
+    return min(100.0,score),reasons,flags,{'spring':spring}
 
 
 def _verify_sl_against_structure(direction, sl, structure_levels):
@@ -3263,15 +3313,10 @@ def stats():
         rows=[dict(x) for x in con.execute("SELECT * FROM trades").fetchall()]
         con.close()
     closed=[r for r in rows if r['status']=='CLOSED' and r.get('final_result')!='EXPIRED_NO_ENTRY']
-    market=[r for r in closed if (r.get('trade_type') or 'MARKET_GEMINI')=='MARKET_GEMINI']
-    limit=[r for r in closed if r.get('trade_type') in ('LIMIT_QUANT','LIMIT_GEMINI_ZONE')]
-    g=_group_stats(market)
-    allg=_group_stats(closed)
+    g=_group_stats(closed)
     return {
         'total':len(rows),
         'open':sum(r['status'] in ('WAITING_ENTRY','OPEN') for r in rows),
-        'pending':sum(r['status']=='PENDING_LIMIT' for r in rows),
-        'expired':sum(r.get('final_result')=='EXPIRED_NO_ENTRY' for r in rows),
         'closed':len(closed),
         'wins':sum(r.get('final_result')=='TP3_WIN' for r in closed),
         'losses':sum(r.get('final_result')=='SL_LOSS' for r in closed),
@@ -3280,9 +3325,7 @@ def stats():
         'tp1_rate':g['tp1_rate'] or 0,
         'positive_rate':g['positive_rate'] or 0,
         'expectancy_r':g['avg_r'],
-        'market_gemini':g,
-        'limit_quant':_group_stats(limit),
-        'combined':allg,
+        'combined':g,
     }
 
 def factor_backtest_report(min_sample=FACTOR_MIN_SAMPLE):
